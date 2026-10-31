@@ -1,0 +1,34 @@
+# Runtime data and test environments
+**/TestAppData*/
+**/manifest.json*
+**/settings.json*
+**/video_archive.txt
+**/Logs/
+**/test-session.log
+
+# Authentication and secrets
+.cookies*
+*.cookie
+.env
+.env.*
+
+# Downloaded media and temporary files
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.opus
+*.part
+*.ytdl
+*.tmp
+*.temp
+
+# Editor and operating system
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Temporary test files
+PesterTest/YT-Downloader.Tests1.ps1
