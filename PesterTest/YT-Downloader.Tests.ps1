@@ -350,7 +350,7 @@ Describe "Phase 1: Get-RetryPlan Logic" {
         $eligibleItem.RetryCount | Should -Be 1
     }
 
-    It "Does not save or touch `$script:Manifest`" {
+    It 'Does not save or touch $script:Manifest' {
         $guid = [guid]::NewGuid().ToString()
         $originalManifest = @(
             [PSCustomObject]@{ Id=$guid; Url="https://youtube.com/watch?v=12345678901"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$TestDrive; Status="Failed"; Error=""; OutputFilePath=""; VideoId="12345678901"; RetryCount=3; AttemptCount=4 }
