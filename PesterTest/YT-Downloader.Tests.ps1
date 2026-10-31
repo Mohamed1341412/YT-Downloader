@@ -184,6 +184,7 @@ Describe "Phase 1: Execution and State Logic" {
                 }
             }
         }
+        Mock Test-FileValidity { return $true }
     }
 
     It "Exhausted element does not start new download (yt-dlp not invoked)" {
@@ -214,7 +215,7 @@ Describe "Phase 1: Execution and State Logic" {
         Save-AtomicJson -Path (Join-Path $script:AppDir "manifest.json") -Data $script:Manifest
         
         Invoke-ItemDownload -Item $item | Should -BeFalse
-        Should -Invoke -CommandName yt-dlp -Times 4
+        Should -Invoke -CommandName yt-dlp -Times 4 -Exactly
         $item.AttemptCount | Should -Be 4
     }
 
@@ -248,7 +249,7 @@ Describe "Phase 1: Execution and State Logic" {
         Save-AtomicJson -Path (Join-Path $script:AppDir "manifest.json") -Data $script:Manifest
         
         Invoke-ItemDownload -Item $item | Should -BeTrue
-        Should -Invoke -CommandName yt-dlp -Times 2
+        Should -Invoke -CommandName yt-dlp -Times 2 -Exactly
         $item.Status | Should -Be "Success"
     }
 
@@ -284,7 +285,7 @@ Describe "Phase 1: Execution and State Logic" {
         }
         
         Invoke-ItemDownload -Item $item | Should -BeTrue
-        Should -Invoke -CommandName yt-dlp -Times 1
+        Should -Invoke -CommandName yt-dlp -Times 1 -Exactly
     }
 
     It "Save failure prevents download" {
@@ -387,29 +388,27 @@ Describe "Phase 1: Get-RetryPlan Logic" {
         $plan.ItemsToRun.Id | Should -Not -Contain $guid2
     }
 
-    It "Marks item as Failed if VideoId is invalid and URL is not YouTube" {
-        $guid = [guid]::NewGuid().ToString()
-        $manifest = @(
-            [PSCustomObject]@{ Id=$guid; Url="https://example.com/video"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$TestDrive; Status="Failed"; Error=""; OutputFilePath=""; VideoId=""; RetryCount=0; AttemptCount=1 }
-        )
-        
-        $plan = Get-RetryPlan -Manifest $manifest
-        $plan.ItemsToRun.Count | Should -Be 0
-        $plan.ModifiedManifest[0].Status | Should -Be "Failed"
-        $plan.ModifiedManifest[0].Error | Should -Be "Invalid YouTube URL / VideoId"
-    }
+It "Marks invalid-VideoId item Failed while still running valid ones" {
+    $good = [guid]::NewGuid().ToString(); $bad = [guid]::NewGuid().ToString()
+    $manifest = @(
+        [PSCustomObject]@{ Id=$bad;  Url="https://example.com/video"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$TestDrive; Status="Failed"; Error=""; OutputFilePath=""; VideoId=""; RetryCount=0; AttemptCount=1 },
+        [PSCustomObject]@{ Id=$good; Url="https://youtube.com/watch?v=12345678901"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$TestDrive; Status="Failed"; Error=""; OutputFilePath=""; VideoId="12345678901"; RetryCount=0; AttemptCount=1 }
+    )
+    $plan = Get-RetryPlan -Manifest $manifest
+    $plan.ItemsToRun.Count | Should -Be 1
+    $plan.ItemsToRun[0].Id | Should -Be $good
+    $badEntry = $plan.ModifiedManifest | Where-Object { $_.Id -eq $bad }
+    $badEntry.Status | Should -Be "Failed"
+    $badEntry.Error | Should -Be "Invalid YouTube URL / VideoId"
+}
 
-    It "Handles old element with only RetryCount" {
-        $guid = [guid]::NewGuid().ToString()
-        $manifest = @(
-            [PSCustomObject]@{ Id=$guid; Url="https://youtube.com/watch?v=12345678901"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$TestDrive; Status="Failed"; Error=""; OutputFilePath=""; VideoId="12345678901"; RetryCount=2 }
-        )
-        
-        $plan = Get-RetryPlan -Manifest $manifest
-        $plan.ItemsToRun.Count | Should -Be 1
-        $plan.ItemsToRun[0].AttemptCount | Should -Be 2
-        $plan.ItemsToRun[0].RetryCount | Should -Be 1
-    }
+It "Returns no plan when the only candidate has an invalid VideoId" {
+    $bad = [guid]::NewGuid().ToString()
+    $manifest = @([PSCustomObject]@{ Id=$bad; Url="https://example.com/video"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$TestDrive; Status="Failed"; Error=""; OutputFilePath=""; VideoId=""; RetryCount=0; AttemptCount=1 })
+    $plan = Get-RetryPlan -Manifest $manifest
+    $plan.ItemsToRun.Count | Should -Be 0
+    $plan.ModifiedManifest | Should -BeNullOrEmpty
+}
 }
 
 Describe "Phase 1: Set-ItemState Mutation" {
