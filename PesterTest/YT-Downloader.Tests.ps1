@@ -48,6 +48,8 @@ $global:LASTEXITCODE = 0
     # 4. تحميل السكريبت (Dot-sourcing) قبل أي Mocks للدوال الداخلية لتجنب أخطاء Pester
     . "$PSScriptRoot\YT-Downloader.ps1"
 
+    function global:yt-dlp { }   # placeholder علشان Pester يقدر يعمل Mock لها
+
     # 5. Mocks لوظائف النظام
     Mock Start-Sleep { }
     Mock Read-Host { return "1" }
@@ -57,6 +59,7 @@ $global:LASTEXITCODE = 0
 AfterAll {
     $env:APPDATA = $script:OrigAppData
     $env:PATH = $script:OrigPath
+    Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
 }
 
 Describe "Phase 1: Configuration and Schema Validation" {
