@@ -33,3 +33,4 @@ Desktop.ini
 # Temporary test files
 PesterTest/YT-Downloader.Tests1.ps1
 PesterTest/pester-output.txt
+PesterTest/pester-output-ps51.txt

@@ -1,4 +1,4 @@
-#Requires -Modules Pester
+﻿#Requires -Modules Pester
 # YT-Downloader.Tests.ps1
 
 BeforeAll {
