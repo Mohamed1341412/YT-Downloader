@@ -263,29 +263,23 @@ Describe "Phase 1: Execution and State Logic" {
         }
         $script:Manifest = @($item)
         Save-AtomicJson -Path (Join-Path $script:AppDir "manifest.json") -Data $script:Manifest
-        
+
+        $script:testGuid = $guid
+        $script:savedAttemptAtCall = $null
         Mock yt-dlp {
             param([string]$Url)
             $global:LASTEXITCODE = 0
-            
-            # Read manifest to verify AttemptCount was saved as 1 before this call
-            $manifestPath = Join-Path $script:AppDir "manifest.json"
-            $currentManifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
-            $savedItem = $currentManifest | Where-Object { $_.Id -eq $guid }
-            $savedItem.AttemptCount | Should -Be 1
-            
+            $m = Get-Content -LiteralPath (Join-Path $script:AppDir "manifest.json") -Raw | ConvertFrom-Json
+            $script:savedAttemptAtCall = (@($m) | Where-Object { $_.Id -eq $script:testGuid }).AttemptCount
             $idx1 = [Array]::IndexOf($args, '--print-to-file')
-            if ($idx1 -ge 0 -and ($idx1 + 2) -lt $args.Count) {
-                "MockVideoId123" | Out-File -FilePath $args[$idx1 + 2] -Encoding UTF8
-            }
+            if ($idx1 -ge 0) { "MockVideoId123" | Out-File -FilePath $args[$idx1 + 2] -Encoding UTF8 }
             $idx2 = [Array]::IndexOf($args, '--print-to-file', $idx1 + 1)
-            if ($idx2 -ge 0 -and ($idx2 + 2) -lt $args.Count) {
-                "C:\Mock\Path\video.mp4" | Out-File -FilePath $args[$idx2 + 2] -Encoding UTF8
-            }
+            if ($idx2 -ge 0) { "C:\Mock\Path\video.mp4" | Out-File -FilePath $args[$idx2 + 2] -Encoding UTF8 }
         }
-        
+
         Invoke-ItemDownload -Item $item | Should -BeTrue
         Should -Invoke -CommandName yt-dlp -Times 1 -Exactly
+        $script:savedAttemptAtCall | Should -Be 1
     }
 
     It "Save failure prevents download" {
