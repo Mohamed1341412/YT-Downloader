@@ -68,6 +68,73 @@ function Get-MaxAttempts {
     return ([int]$script:Config.MaxRetries + 1)
 }
 
+function Get-RetryPlan {
+    param(
+        [object]$Manifest = $script:Manifest
+    )
+    $maxAttempts = Get-MaxAttempts
+    $candidates = @()
+    
+    foreach ($m in $Manifest) {
+        $eligible = $false
+        if ($m.Status -in @("Failed", "Pending", "Downloading")) {
+            $eligible = $true
+        }
+        elseif ($m.Status -eq "Success" -and -not (Test-FileValidity -FilePath $m.OutputFilePath -Mode $m.Mode)) {
+            $eligible = $true
+        }
+        if ($eligible) { $candidates += $m }
+    }
+
+    if ($candidates.Count -eq 0) {
+        return @{ ModifiedManifest = $null; ItemsToRun = @() }
+    }
+
+    $tempManifest = Copy-Manifest -Source $Manifest
+    $toRun = @()
+    
+    foreach ($c in $candidates) {
+        $idx = -1
+        for ($i = 0; $i -lt $tempManifest.Count; $i++) {
+            if ([string]$tempManifest[$i].Id -eq [string]$c.Id) { $idx = $i; break }
+        }
+        if ($idx -lt 0) { continue }
+        
+        $entry = $tempManifest[$idx]
+        
+        # تصفير العدادات فقط إذا كان العنصر مستنفداً بالفعل
+        if ([int]$entry.AttemptCount -ge $maxAttempts) {
+            $entry.AttemptCount = 0
+            $entry.RetryCount = 0
+        }
+        
+        $vid = if ($entry.VideoId) { $entry.VideoId } else { Get-VideoId -Url $entry.Url }
+        if ([string]::IsNullOrWhiteSpace($vid)) {
+            $entry.Status = "Failed"
+            $entry.Error = "Invalid YouTube URL / VideoId"
+            continue
+        }
+        
+        $previousStatus = [string]$entry.Status
+        $entry.Status = "Pending"
+        $entry.Error = ""
+        $entry.VideoId = $vid
+        
+        if ($previousStatus -ne 'Success' -or -not (Test-FileValidity -FilePath $entry.OutputFilePath -Mode $entry.Mode)) {
+            $entry.OutputFilePath = ""
+        }
+        
+        $entry.RetryCount = [Math]::Min((Get-MaxAttempts) - 1, [Math]::Max(0, [int]$entry.AttemptCount - 1))
+        $toRun += $entry
+    }
+    
+    if ($toRun.Count -eq 0) {
+        return @{ ModifiedManifest = $null; ItemsToRun = @() }
+    }
+    
+    return @{ ModifiedManifest = $tempManifest; ItemsToRun = $toRun }
+}
+
 function Copy-Manifest {
     param([object]$Source)
     $copy = @()
@@ -1239,67 +1306,16 @@ function Main {
                 }
             }
             "6" {
-                $maxAttempts = Get-MaxAttempts
-                $candidates = @()
-                foreach ($m in $script:Manifest) {
-                    $eligible = $false
-
-					if ($m.Status -in @("Failed", "Pending", "Downloading")) {
-						$eligible = $true
-					}
-					elseif (
-						$m.Status -eq "Success" -and
-						-not (Test-FileValidity -FilePath $m.OutputFilePath -Mode $m.Mode)
-					) {
-						$eligible = $true
-					}
-                    if ($eligible) { $candidates += $m }
-                }
-                if ($candidates.Count -eq 0) {
-                    Write-Log "No failed or interrupted items to retry." "Yellow"
+                $plan = Get-RetryPlan
+                if ($plan.ItemsToRun.Count -eq 0) {
+                    Write-Log "No eligible items to retry. The attempt budget may be exhausted or no failed items found." "Yellow"
                     Read-Host "Press Enter to continue"
                     continue
                 }
-                $tempManifest = Copy-Manifest -Source $script:Manifest
-                $toRun = @()
-                foreach ($c in $candidates) {
-                    $idx = -1
-                    for ($i = 0; $i -lt $tempManifest.Count; $i++) {
-                        if ([string]$tempManifest[$i].Id -eq [string]$c.Id) { $idx = $i; break }
-                    }
-                    if ($idx -lt 0) { continue }
-                    $entry = $tempManifest[$idx]
-                    if ([int]$entry.AttemptCount -ge $maxAttempts) {
-						# Explicit retry by the user starts a new attempt cycle.
-						$entry.AttemptCount = 0
-						$entry.RetryCount = 0
-					}
-                    $vid = if ($entry.VideoId) { $entry.VideoId } else { Get-VideoId -Url $entry.Url }
-                    if ([string]::IsNullOrWhiteSpace($vid)) {
-                        $entry.Status = "Failed"
-                        $entry.Error = "Invalid YouTube URL / VideoId"
-                        continue
-                    }
-                    # A Downloading item represents an attempt already started; resume with the next attempt.
-                    # AttemptCount is persisted before yt-dlp runs, so do not increment it here.
-                    $previousStatus = [string]$entry.Status
-                    $entry.Status = "Pending"
-                    $entry.Error = ""
-                    $entry.VideoId = $vid
-                    if ($previousStatus -ne 'Success' -or -not (Test-FileValidity -FilePath $entry.OutputFilePath -Mode $entry.Mode)) {
-                        $entry.OutputFilePath = ""
-                    }
-                    $entry.RetryCount = [Math]::Min((Get-MaxAttempts) - 1, [Math]::Max(0, [int]$entry.AttemptCount - 1))
-                    $toRun += $entry
-                }
-                if ($toRun.Count -eq 0) {
-                    Write-Log "No valid items remain eligible for retry." "Yellow"
-                    Read-Host "Press Enter to continue"
-                    continue
-                }
-                if (Save-AtomicJson -Path $script:ManifestPath -Data $tempManifest) {
-                    $script:Manifest = $tempManifest
-                    $itemsToRun = $toRun
+                
+                if (Save-AtomicJson -Path $script:ManifestPath -Data $plan.ModifiedManifest) {
+                    $script:Manifest = $plan.ModifiedManifest
+                    $itemsToRun = $plan.ItemsToRun
                     $isResume = $true
                 } else {
                     $script:RunState.ManifestSaved = $false
