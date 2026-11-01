@@ -68,6 +68,210 @@ function Get-MaxAttempts {
     return ([int]$script:Config.MaxRetries + 1)
 }
 
+function Get-InvalidTargetPath {
+    param(
+        [string]$FilePath,
+        [string]$Directory
+    )
+    $fileName = [System.IO.Path]::GetFileName($FilePath)
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $guidShort = [guid]::NewGuid().ToString().Substring(0, 8)
+    # المواصفة: <الاسم الكامل بالامتداد>.invalid_<ts>_<guid8>
+    $newFileName = "${fileName}.invalid_${timestamp}_${guidShort}"
+    return Join-Path $Directory $newFileName
+}
+
+function Get-MediaInfo {
+    param([string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path -LiteralPath $FilePath)) {
+        return @{ Success = $false; Error = "File not found"; IsCommandFailure = $false }
+    }
+    try {
+        $probeArgs = @(
+            "-v", "error",
+            "-count_packets",
+            "-show_entries", "stream=codec_type,nb_read_packets",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            $FilePath
+        )
+        $raw = & ffprobe @probeArgs 2>$null
+        $exitCode = $LASTEXITCODE
+        
+        # إذا فشل الأمر نفسه (غير موجود) فهو Unknown، أما إذا نجح الأمر لكن الملف تالف (exit code != 0) فهو Corrupt
+        if ($exitCode -ne 0) {
+            return @{ Success = $false; Error = "ffprobe exited with code $exitCode"; IsCommandFailure = $false }
+        }
+        
+        $jsonText = $raw -join [Environment]::NewLine
+        $data = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        
+        $hasVideo = $false; $videoPackets = 0
+        $hasAudio = $false; $audioPackets = 0
+        
+        if ($data.streams) {
+            foreach ($stream in $data.streams) {
+                if ($stream.codec_type -eq 'video') { 
+                    $hasVideo = $true
+                    $parsed = 0
+                    [int]::TryParse([string]$stream.nb_read_packets, [ref]$parsed) | Out-Null
+                    $videoPackets = $parsed
+                }
+                if ($stream.codec_type -eq 'audio') { 
+                    $hasAudio = $true
+                    $parsed = 0
+                    [int]::TryParse([string]$stream.nb_read_packets, [ref]$parsed) | Out-Null
+                    $audioPackets = $parsed
+                }
+            }
+        }
+        
+        $duration = 0.0
+        if ($data.format -and $data.format.duration) {
+            [double]::TryParse([string]$data.format.duration, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$duration) | Out-Null
+        }
+
+        return @{ 
+            Success = $true
+            Duration = $duration
+            HasVideo = $hasVideo
+            HasAudio = $hasAudio
+            VideoPackets = $videoPackets
+            AudioPackets = $audioPackets
+            Error = $null
+            IsCommandFailure = $false
+        }
+    }
+    catch [System.Management.Automation.CommandNotFoundException] {
+        return @{ Success = $false; Error = "ffprobe not found"; IsCommandFailure = $true }
+    }
+    catch {
+        return @{ Success = $false; Error = "Exception: $($_.Exception.Message)"; IsCommandFailure = $true }
+    }
+}
+
+function Get-FileVerdict {
+    param(
+        [string]$FilePath,
+        [ValidateSet("Video", "Audio")]
+        [string]$Mode
+    )
+    if ([string]::IsNullOrWhiteSpace($FilePath)) {
+        return @{ Verdict = "Corrupt"; Reason = "Empty file path" }
+    }
+    
+    $fileItem = Get-Item -LiteralPath $FilePath -ErrorAction SilentlyContinue
+    if (-not $fileItem -or $fileItem.PSIsContainer -or $fileItem.Length -le 0) {
+        return @{ Verdict = "Corrupt"; Reason = "File missing, is a directory, or zero length" }
+    }
+
+    $mediaInfo = Get-MediaInfo -FilePath $FilePath
+    
+    # Unknown فقط إذا كان ffprobe غير متاح أو حدث استثناء غير متوقع
+    if (-not $mediaInfo.Success -and $mediaInfo.IsCommandFailure) {
+        return @{ Verdict = "Unknown"; Reason = "ffprobe failed or unavailable: $($mediaInfo.Error)" }
+    }
+    
+    # إذا نجح تشغيل ffprobe لكنه أرجع خطأ في قراءة الملف، فهو تالف
+    if (-not $mediaInfo.Success -and -not $mediaInfo.IsCommandFailure) {
+        return @{ Verdict = "Corrupt"; Reason = "ffprobe failed to read file: $($mediaInfo.Error)" }
+    }
+
+    # التحقق من أن المدة > 0
+    if ($mediaInfo.Duration -le 0) {
+        return @{ Verdict = "Corrupt"; Reason = "Invalid or zero duration" }
+    }
+
+    if ($Mode -eq "Video") {
+        if (-not $mediaInfo.HasVideo) {
+            return @{ Verdict = "OtherMode"; Reason = "No video stream found" }
+        }
+        if ($mediaInfo.VideoPackets -le 0) {
+            return @{ Verdict = "Corrupt"; Reason = "Video stream has 0 or negative packets" }
+        }
+        return @{ Verdict = "Valid"; Reason = "Valid video file" }
+    }
+    else { # Mode -eq "Audio"
+        if ($mediaInfo.HasVideo) {
+            return @{ Verdict = "OtherMode"; Reason = "Contains video stream (expected audio only)" }
+        }
+        if (-not $mediaInfo.HasAudio) {
+            return @{ Verdict = "OtherMode"; Reason = "No audio stream found" }
+        }
+        if ($mediaInfo.AudioPackets -le 0) {
+            return @{ Verdict = "Corrupt"; Reason = "Audio stream has 0 or negative packets" }
+        }
+        return @{ Verdict = "Valid"; Reason = "Valid audio file" }
+    }
+}
+
+function Test-PathInsideDirectory {
+    param(
+        [string]$Path,
+        [string]$Directory
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Directory)) {
+        return $false
+    }
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $fullDir = [System.IO.Path]::GetFullPath($Directory)
+        
+        # ضمان انتهاء مسار المجلد بفاصل للمقارنة الدقيقة
+        if (-not $fullDir.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+            $fullDir += [System.IO.Path]::DirectorySeparatorChar
+        }
+        
+        # التحقق من أنه ملف (Leaf) وليس مجلداً
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            return $false
+        }
+        
+        # التحقق من كونه ابناً مباشراً (Direct Child) فقط
+        $parentDir = [System.IO.Path]::GetDirectoryName($fullPath)
+        if (-not $parentDir.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+            $parentDir += [System.IO.Path]::DirectorySeparatorChar
+        }
+        
+        return $parentDir.Equals($fullDir, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Move-ToInvalid {
+    param(
+        [string]$FilePath,
+        [string]$Directory
+    )
+    $result = @{ Success = $false; NewPath = $null; Error = $null }
+    
+    if (-not (Test-PathInsideDirectory -Path $FilePath -Directory $Directory)) {
+        $result.Error = "Path validation failed: File is not a direct child of the target directory or does not exist."
+        return $result
+    }
+
+    try {
+        $newPath = Get-InvalidTargetPath -FilePath $FilePath -Directory $Directory
+        
+        # منع الكتابة فوق ملف معزول موجود مسبقاً
+        if (Test-Path -LiteralPath $newPath) {
+            $result.Error = "Target invalid file already exists. Aborting move to prevent overwrite."
+            return $result
+        }
+        
+        [System.IO.File]::Move($FilePath, $newPath)
+        $result.Success = $true
+        $result.NewPath = $newPath
+    }
+    catch {
+        $result.Error = "Move failed: $($_.Exception.Message)"
+    }
+    
+    return $result
+}
+
 function Get-RetryPlan {
     param(
         [object]$Manifest = $script:Manifest
