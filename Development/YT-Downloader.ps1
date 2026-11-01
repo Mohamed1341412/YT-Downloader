@@ -96,9 +96,9 @@ function Get-MediaInfo {
             $FilePath
         )
         $raw = & ffprobe @probeArgs 2>$null
-        $exitCode = $LASTEXITCODE
+        $exitCode = $global:LASTEXITCODE
         
-        # إذا فشل الأمر نفسه (غير موجود) فهو Unknown، أما إذا نجح الأمر لكن الملف تالف (exit code != 0) فهو Corrupt
+        # إذا فشل الأمر نفسه (exit code != 0) فهو Corrupt (ملف تالف)، وليس Unknown
         if ($exitCode -ne 0) {
             return @{ Success = $false; Error = "ffprobe exited with code $exitCode"; IsCommandFailure = $false }
         }
@@ -146,6 +146,7 @@ function Get-MediaInfo {
         return @{ Success = $false; Error = "ffprobe not found"; IsCommandFailure = $true }
     }
     catch {
+        # يشمل ذلك أخطاء JSON أو أي استثناء غير متوقع أثناء التنفيذ
         return @{ Success = $false; Error = "Exception: $($_.Exception.Message)"; IsCommandFailure = $true }
     }
 }
@@ -175,6 +176,11 @@ function Get-FileVerdict {
     # إذا نجح تشغيل ffprobe لكنه أرجع خطأ في قراءة الملف، فهو تالف
     if (-not $mediaInfo.Success -and -not $mediaInfo.IsCommandFailure) {
         return @{ Verdict = "Corrupt"; Reason = "ffprobe failed to read file: $($mediaInfo.Error)" }
+    }
+
+    # إضافة شرط جديد: ملف بدون أي مسارات صوت أو فيديو يعتبر تالفاً لمنع اعتباره OtherMode وتركه مكانه
+    if (-not $mediaInfo.HasVideo -and -not $mediaInfo.HasAudio) {
+        return @{ Verdict = "Corrupt"; Reason = "No audio or video streams" }
     }
 
     # التحقق من أن المدة > 0
@@ -217,17 +223,14 @@ function Test-PathInsideDirectory {
         $fullPath = [System.IO.Path]::GetFullPath($Path)
         $fullDir = [System.IO.Path]::GetFullPath($Directory)
         
-        # ضمان انتهاء مسار المجلد بفاصل للمقارنة الدقيقة
         if (-not $fullDir.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
             $fullDir += [System.IO.Path]::DirectorySeparatorChar
         }
         
-        # التحقق من أنه ملف (Leaf) وليس مجلداً
         if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
             return $false
         }
         
-        # التحقق من كونه ابناً مباشراً (Direct Child) فقط
         $parentDir = [System.IO.Path]::GetDirectoryName($fullPath)
         if (-not $parentDir.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
             $parentDir += [System.IO.Path]::DirectorySeparatorChar
@@ -255,7 +258,6 @@ function Move-ToInvalid {
     try {
         $newPath = Get-InvalidTargetPath -FilePath $FilePath -Directory $Directory
         
-        # منع الكتابة فوق ملف معزول موجود مسبقاً
         if (Test-Path -LiteralPath $newPath) {
             $result.Error = "Target invalid file already exists. Aborting move to prevent overwrite."
             return $result
