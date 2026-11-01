@@ -421,3 +421,205 @@ Describe "Phase 1: Set-ItemState Mutation" {
         $script:Manifest[0].Status | Should -Be "Downloading"
     }
 }
+
+Describe "Phase 3 - Delivery 1: Pure Helper Functions" {
+     BeforeAll {
+        function global:ffprobe { }
+    }
+
+    AfterAll {
+        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+    }
+
+    BeforeEach {
+        $script:TestDir = Join-Path $TestDrive "TestDir"
+        $script:TestDir2 = Join-Path $TestDrive "TestDir2"
+        New-Item -ItemType Directory -Path $script:TestDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $script:TestDir2 -Force | Out-Null
+
+        $script:ValidVideoPath = Join-Path $script:TestDir "valid_video.mp4"
+        $script:ValidAudioPath = Join-Path $script:TestDir "valid_audio.mp3"
+        $script:ZeroLengthPath = Join-Path $script:TestDir "zero_length.mp4"
+
+        Set-Content -Path $script:ValidVideoPath -Value "dummy video content" -Force
+        Set-Content -Path $script:ValidAudioPath -Value "dummy audio content" -Force
+        New-Item -ItemType File -Path $script:ZeroLengthPath -Force | Out-Null
+    }
+
+    Context "Get-MediaInfo" {
+        It "Parses real-world case: video without nb_read_packets, audio with it" {
+            Mock ffprobe {
+                $global:LASTEXITCODE = 0
+                return '{"streams":[{"codec_type":"video"},{"codec_type":"audio","nb_read_packets":"3002"}],"format":{"duration":"60.041000"}}'
+            }
+            $info = Get-MediaInfo -FilePath $script:ValidVideoPath
+            $info.Success | Should -BeTrue
+            $info.VideoPackets | Should -Be 0
+            $info.AudioPackets | Should -Be 3002
+            $info.Duration | Should -Be 60.041
+            $info.IsCommandFailure | Should -BeFalse
+        }
+
+        It "Parses 'N/A' as 0 without throwing exception" {
+            Mock ffprobe {
+                $global:LASTEXITCODE = 0
+                return '{"streams":[{"codec_type":"video","nb_read_packets":"N/A"}],"format":{"duration":"10.0"}}'
+            }
+            $info = Get-MediaInfo -FilePath $script:ValidVideoPath
+            $info.Success | Should -BeTrue
+            $info.VideoPackets | Should -Be 0
+            $info.IsCommandFailure | Should -BeFalse
+        }
+
+        It "Returns Success=false, IsCommandFailure=false on exit code 1" {
+            Mock ffprobe {
+                $global:LASTEXITCODE = 1
+                return "Invalid data found when processing input"
+            }
+            $info = Get-MediaInfo -FilePath $script:ValidVideoPath
+            $info.Success | Should -BeFalse
+            $info.IsCommandFailure | Should -BeFalse
+        }
+
+        It "Returns IsCommandFailure=true on exception (throw)" {
+            Mock ffprobe {
+                $global:LASTEXITCODE = 0
+                throw "boom"
+            }
+            $info = Get-MediaInfo -FilePath $script:ValidVideoPath
+            $info.Success | Should -BeFalse
+            $info.IsCommandFailure | Should -BeTrue
+        }
+
+        It "Returns IsCommandFailure=true on corrupt JSON with exit 0" {
+            Mock ffprobe {
+                $global:LASTEXITCODE = 0
+                return "this is not valid json"
+            }
+            $info = Get-MediaInfo -FilePath $script:ValidVideoPath
+            $info.Success | Should -BeFalse
+            $info.IsCommandFailure | Should -BeTrue
+        }
+    }
+
+    Context "Get-FileVerdict" {
+        It "Returns Corrupt for zero-length file" {
+            $verdict = Get-FileVerdict -FilePath $script:ZeroLengthPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Corrupt"
+        }
+
+        It "Returns Corrupt when file has no audio or video streams" {
+            Mock Get-MediaInfo { 
+                return @{ Success = $true; HasVideo = $false; HasAudio = $false; VideoPackets = 0; AudioPackets = 0; Duration = 10.0; Error = $null; IsCommandFailure = $false } 
+            }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Corrupt"
+            $verdict.Reason | Should -Be "No audio or video streams"
+        }
+
+        It "Returns Valid for proper Video mode" {
+            Mock Get-MediaInfo { return @{ Success = $true; HasVideo = $true; HasAudio = $false; VideoPackets = 100; AudioPackets = 0; Duration = 10.0; Error = $null; IsCommandFailure = $false } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Valid"
+        }
+
+        It "Returns Corrupt for Video with 0 packets" {
+            Mock Get-MediaInfo { return @{ Success = $true; HasVideo = $true; HasAudio = $false; VideoPackets = 0; AudioPackets = 0; Duration = 10.0; Error = $null; IsCommandFailure = $false } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Corrupt"
+        }
+        
+        It "Returns Corrupt for Duration <= 0" {
+            Mock Get-MediaInfo { return @{ Success = $true; HasVideo = $true; HasAudio = $false; VideoPackets = 100; AudioPackets = 0; Duration = 0.0; Error = $null; IsCommandFailure = $false } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Corrupt"
+        }
+
+        It "Returns OtherMode when checking Video mode on an Audio-only file" {
+            Mock Get-MediaInfo { return @{ Success = $true; HasVideo = $false; HasAudio = $true; VideoPackets = 0; AudioPackets = 100; Duration = 10.0; Error = $null; IsCommandFailure = $false } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidAudioPath -Mode "Video"
+            $verdict.Verdict | Should -Be "OtherMode"
+        }
+
+        It "Returns OtherMode when checking Audio mode on a file containing Video" {
+            Mock Get-MediaInfo { return @{ Success = $true; HasVideo = $true; HasAudio = $true; VideoPackets = 100; AudioPackets = 100; Duration = 10.0; Error = $null; IsCommandFailure = $false } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Audio"
+            $verdict.Verdict | Should -Be "OtherMode"
+        }
+
+        It "Returns Unknown when Get-MediaInfo indicates command failure" {
+            Mock Get-MediaInfo { return @{ Success = $false; Error = "ffprobe not found"; IsCommandFailure = $true } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Unknown"
+        }
+        
+        It "Returns Corrupt when Get-MediaInfo indicates file read failure (non-zero exit)" {
+            Mock Get-MediaInfo { return @{ Success = $false; Error = "ffprobe exited with code 1"; IsCommandFailure = $false } }
+            $verdict = Get-FileVerdict -FilePath $script:ValidVideoPath -Mode "Video"
+            $verdict.Verdict | Should -Be "Corrupt"
+        }
+    }
+
+    Context "Test-PathInsideDirectory" {
+        It "Returns true for valid direct child file" {
+            Test-PathInsideDirectory -Path $script:ValidVideoPath -Directory $script:TestDir | Should -BeTrue
+        }
+
+        It "Returns false for path outside directory (C:\out vs C:\out2 trap)" {
+            $outsideFile = Join-Path $script:TestDir2 "outside.mp4"
+            Set-Content -Path $outsideFile -Value "x" -Force
+            Test-PathInsideDirectory -Path $outsideFile -Directory $script:TestDir | Should -BeFalse
+        }
+
+        It "Returns false for directory traversal (..)" {
+            $escapePath = Join-Path $script:TestDir "..\escape.txt"
+            New-Item -ItemType File -Path (Join-Path $TestDrive "escape.txt") -Force | Out-Null
+            Test-PathInsideDirectory -Path $escapePath -Directory $script:TestDir | Should -BeFalse
+        }
+
+        It "Returns false if path is a directory, not a file" {
+            Test-PathInsideDirectory -Path $script:TestDir -Directory $TestDrive | Should -BeFalse
+        }
+
+        It "Returns false for empty path" {
+            Test-PathInsideDirectory -Path "" -Directory $script:TestDir | Should -BeFalse
+        }
+        
+        It "Returns false for file in subdirectory (not direct child)" {
+            $subDir = Join-Path $script:TestDir "SubDir"
+            New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+            $subFile = Join-Path $subDir "sub.mp4"
+            Set-Content -Path $subFile -Value "x" -Force
+            Test-PathInsideDirectory -Path $subFile -Directory $script:TestDir | Should -BeFalse
+        }
+    }
+
+    Context "Move-ToInvalid" {
+        It "Successfully moves file and generates correct naming convention" {
+            $moveResult = Move-ToInvalid -FilePath $script:ValidVideoPath -Directory $script:TestDir
+            $moveResult.Success | Should -BeTrue
+            $moveResult.NewPath | Should -Match "\.mp4\.invalid_\d{8}_\d{6}_[0-9a-f]{8}$"
+            Test-Path -LiteralPath $script:ValidVideoPath | Should -BeFalse
+            Test-Path -LiteralPath $moveResult.NewPath | Should -BeTrue
+        }
+
+        It "Fails if path is outside the target directory" {
+            $moveResult = Move-ToInvalid -FilePath $script:ValidVideoPath -Directory $script:TestDir2
+            $moveResult.Success | Should -BeFalse
+            $moveResult.Error | Should -Match "validation failed"
+            Test-Path -LiteralPath $script:ValidVideoPath | Should -BeTrue
+        }
+
+        It "Fails if target invalid file already exists (prevents overwrite)" {
+            $mockTargetPath = Join-Path $script:TestDir "valid_video.mp4.invalid_20231010_120000_12345678"
+            Set-Content -Path $mockTargetPath -Value "existing" -Force
+            
+            Mock Get-InvalidTargetPath { return $mockTargetPath }
+            
+            $moveResult = Move-ToInvalid -FilePath $script:ValidVideoPath -Directory $script:TestDir
+            $moveResult.Success | Should -BeFalse
+            $moveResult.Error | Should -Match "already exists"
+            Test-Path -LiteralPath $script:ValidVideoPath | Should -BeTrue
+        }
+    }
+}
