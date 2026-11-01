@@ -34,3 +34,5 @@ Desktop.ini
 PesterTest/YT-Downloader.Tests1.ps1
 PesterTest/pester-output.txt
 PesterTest/pester-output-ps51.txt
+pester-ps51.txt
+pester-ps7.txt
