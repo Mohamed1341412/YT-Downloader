@@ -93,7 +93,7 @@ Describe "Phase 1: Configuration and Schema Validation" {
 `$script:Config.MaxRetries = 'invalid'
 Initialize-App
 "@
-        $result = & powershell.exe -NoProfile -Command $scriptBlock 2>&1
+        $result = & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $scriptBlock 2>&1
         $result | Should -Match "FATAL"
         $LASTEXITCODE | Should -Be 1
     }
