@@ -255,23 +255,92 @@ function Move-ToInvalid {
         return $result
     }
 
-    try {
-        $newPath = Get-InvalidTargetPath -FilePath $FilePath -Directory $Directory
-        
-        if (Test-Path -LiteralPath $newPath) {
-            $result.Error = "Target invalid file already exists. Aborting move to prevent overwrite."
+    $maxRetries = 5
+    $lastError = ""
+    for ($i = 1; $i -le $maxRetries; $i++) {
+        try {
+            $newPath = Get-InvalidTargetPath -FilePath $FilePath -Directory $Directory
+            
+            # التحقق من عدم وجود تصادم في الاسم
+            if (Test-Path -LiteralPath $newPath) {
+                continue # تصادم، حاول مرة أخرى باسم جديد
+            }
+            
+            [System.IO.File]::Move($FilePath, $newPath)
+            $result.Success = $true
+            $result.NewPath = $newPath
             return $result
         }
-        
-        [System.IO.File]::Move($FilePath, $newPath)
-        $result.Success = $true
-        $result.NewPath = $newPath
-    }
-    catch {
-        $result.Error = "Move failed: $($_.Exception.Message)"
+        catch [System.IO.IOException] {
+            $lastError = $_.Exception.Message
+            continue
+        }
+        catch {
+            $result.Error = "Move failed: $($_.Exception.Message)"
+            return $result
+        }
     }
     
+    $result.Error = "Move failed after $maxRetries attempts due to persistent naming collisions or file locks. Last error: $lastError"
     return $result
+}
+
+function Find-OutputCandidates {
+    param(
+        [string]$Directory,
+        [string]$VideoId,
+        [ValidateSet("Video", "Audio")]
+        [string]$Mode
+    )
+    $candidates = @()
+    
+    if ([string]::IsNullOrWhiteSpace($Directory) -or [string]::IsNullOrWhiteSpace($VideoId)) {
+        return $candidates
+    }
+
+    try {
+        $fullDir = [System.IO.Path]::GetFullPath($Directory)
+        if (-not (Test-Path -LiteralPath $fullDir -PathType Container)) {
+            return $candidates
+        }
+    } catch {
+        return $candidates
+    }
+
+    $validExts = @('mp4', 'webm', 'mkv', 'mov', 'm4a', 'mp3', 'opus', 'ogg', 'aac', 'flac', 'wav')
+    
+    # جلب الملفات المباشرة فقط (بدون بحث متداخل)
+    $files = Get-ChildItem -LiteralPath $fullDir -File -ErrorAction SilentlyContinue
+    
+    foreach ($file in $files) {
+        $ext = [System.IO.Path]::GetExtension($file.Name).TrimStart('.').ToLowerInvariant()
+        
+        # 1. التحقق من الامتداد المسموح
+        if ($validExts -notcontains $ext) { continue }
+
+        # 2. استبعاد الأنماط المحظورة صراحةً
+        if ($file.Name -match '\.part$|\.ytdl$|\.invalid_|\.bak$|\.tmp$|\.f\d+\.|-Frag\d+\.part') {
+            continue
+        }
+
+        # 3. التحقق من مطابقة المعرّف (حساسة لحالة الحروف Case-Sensitive)
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $expectedSuffix = "_$VideoId"
+        if (-not $baseName.EndsWith($expectedSuffix, [System.StringComparison]::Ordinal)) {
+            continue
+        }
+
+        # 4. الحصول على الحكم المشدد للملف
+        $verdict = Get-FileVerdict -FilePath $file.FullName -Mode $Mode
+        
+        $candidates += [PSCustomObject]@{
+            File    = $file
+            Verdict = $verdict.Verdict
+            Reason  = $verdict.Reason
+        }
+    }
+
+    return $candidates
 }
 
 function Get-RetryPlan {

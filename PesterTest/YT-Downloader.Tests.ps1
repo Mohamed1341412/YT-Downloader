@@ -46,7 +46,7 @@ $global:LASTEXITCODE = 0
     $env:PATH = "$stubDir;$env:PATH"
 
     # 4. تحميل السكريبت (Dot-sourcing) قبل أي Mocks للدوال الداخلية لتجنب أخطاء Pester
-    . "$PSScriptRoot\YT-Downloader.ps1"
+    . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
 
     function global:yt-dlp { }   # placeholder علشان Pester يقدر يعمل Mock لها
 
@@ -86,7 +86,7 @@ Describe "Phase 1: Configuration and Schema Validation" {
 
     It "Exits with code 1 on invalid MaxRetries (Child Process Test)" {
         $testDrivePath = $TestDrive
-        $scriptPath = Join-Path $PSScriptRoot "YT-Downloader.ps1"
+        $scriptPath = Join-Path $PSScriptRoot "..\Development\YT-Downloader.ps1"
         $scriptBlock = @"
 `$env:APPDATA = '$testDrivePath'
 . '$scriptPath'
@@ -610,16 +610,152 @@ Describe "Phase 3 - Delivery 1: Pure Helper Functions" {
             Test-Path -LiteralPath $script:ValidVideoPath | Should -BeTrue
         }
 
-        It "Fails if target invalid file already exists (prevents overwrite)" {
-            $mockTargetPath = Join-Path $script:TestDir "valid_video.mp4.invalid_20231010_120000_12345678"
-            Set-Content -Path $mockTargetPath -Value "existing" -Force
-            
-            Mock Get-InvalidTargetPath { return $mockTargetPath }
-            
+        It "Retries on collision and succeeds on second attempt" {
+            $mockExistingPath = Join-Path $script:TestDir "valid_video.mp4.invalid_20231010_120000_12345678"
+            Set-Content -Path $mockExistingPath -Value "existing" -Force
+
+            $script:callCount = 0
+            Mock Get-InvalidTargetPath {
+                $script:callCount++
+                if ($script:callCount -eq 1) { return $mockExistingPath }
+                return Join-Path $script:TestDir "valid_video.mp4.invalid_20231010_120001_87654321"
+            }
+
+            $moveResult = Move-ToInvalid -FilePath $script:ValidVideoPath -Directory $script:TestDir
+            $moveResult.Success | Should -BeTrue
+            Should -Invoke -CommandName Get-InvalidTargetPath -Times 2 -Exactly
+            Test-Path -LiteralPath $script:ValidVideoPath | Should -BeFalse
+        }
+
+        It "Fails after 5 attempts if collisions persist" {
+            $mockExistingPath = Join-Path $script:TestDir "valid_video.mp4.invalid_20231010_120000_12345678"
+            Set-Content -Path $mockExistingPath -Value "existing" -Force
+
+            Mock Get-InvalidTargetPath { return $mockExistingPath }
+
             $moveResult = Move-ToInvalid -FilePath $script:ValidVideoPath -Directory $script:TestDir
             $moveResult.Success | Should -BeFalse
-            $moveResult.Error | Should -Match "already exists"
+            $moveResult.Error | Should -Match "5 attempts"
+            Should -Invoke -CommandName Get-InvalidTargetPath -Times 5 -Exactly
             Test-Path -LiteralPath $script:ValidVideoPath | Should -BeTrue
         }
     }
+
+    Describe "Phase 3 - Delivery 2: Find-OutputCandidates" {
+    BeforeAll {
+        function global:ffprobe { }
+    }
+
+    AfterAll {
+        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+    }
+
+    BeforeEach {
+        $script:CandidateDir = Join-Path $TestDrive "CandidateDir"
+        New-Item -ItemType Directory -Path $script:CandidateDir -Force | Out-Null
+        
+        $script:SubDir = Join-Path $script:CandidateDir "SubDir"
+        New-Item -ItemType Directory -Path $script:SubDir -Force | Out-Null
+
+        $videoId = "AbC12345678"
+        
+        # ملفات مرشحة صحيحة
+        $script:ValidVideoFile = Join-Path $script:CandidateDir "prefix_${videoId}.mp4"
+        $script:ValidAudioFile = Join-Path $script:CandidateDir "prefix_${videoId}.mp3"
+        Set-Content -Path $script:ValidVideoFile -Value "dummy" -Force
+        Set-Content -Path $script:ValidAudioFile -Value "dummy" -Force
+
+        # ملفات مستبعدة (Excluded)
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}.mp4.part") -Value "x" -Force
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}.invalid_123.mp4") -Value "x" -Force
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}.ytdl") -Value "x" -Force
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}-Frag1.part") -Value "x" -Force
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}.f137.mp4") -Value "x" -Force
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}.mp4.bak") -Value "x" -Force
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_${videoId}.mp4.tmp") -Value "x" -Force
+        
+        # ملف بمعرف خطأ في حالة الأحرف (Case-Sensitive Check)
+        Set-Content -Path (Join-Path $script:CandidateDir "prefix_abc12345678.mp4") -Value "x" -Force
+        
+        # ملف في مجلد فرعي (يجب تجاهله)
+        Set-Content -Path (Join-Path $script:SubDir "prefix_${videoId}.mp4") -Value "x" -Force
+    }
+
+    It "Finds valid candidates and assigns correct verdicts" {
+        Mock ffprobe {
+            $global:LASTEXITCODE = 0
+            return '{"streams":[{"codec_type":"video","nb_read_packets":"100"}],"format":{"duration":"10.0"}}'
+        }
+
+        $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "AbC12345678" -Mode "Video")
+        $candidates.Count | Should -Be 2
+        $names = @($candidates | ForEach-Object { $_.File.Name })
+        $names | Should -Contain "prefix_AbC12345678.mp4"
+        $names | Should -Contain "prefix_AbC12345678.mp3"
+        @($candidates | Where-Object { $_.Verdict -ne "Valid" }).Count | Should -Be 0
+    }
+
+    It "Excludes .part, .ytdl, .invalid_*, -FragN.part, .fNNN, .bak, and .tmp files" {
+        Mock ffprobe {
+            $global:LASTEXITCODE = 0
+            return '{"streams":[{"codec_type":"video","nb_read_packets":"100"}],"format":{"duration":"10.0"}}'
+        }
+
+        $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "AbC12345678" -Mode "Video")
+        @($candidates).Count | Should -BeGreaterThan 0
+        
+        $names = @($candidates | ForEach-Object { $_.File.Name })
+        $names | Should -Not -Contain "prefix_AbC12345678.mp4.part"
+        $names | Should -Not -Contain "prefix_AbC12345678.invalid_123.mp4"
+        $names | Should -Not -Contain "prefix_AbC12345678.ytdl"
+        $names | Should -Not -Contain "prefix_AbC12345678-Frag1.part"
+        $names | Should -Not -Contain "prefix_AbC12345678.f137.mp4"
+        $names | Should -Not -Contain "prefix_AbC12345678.mp4.bak"
+        $names | Should -Not -Contain "prefix_AbC12345678.mp4.tmp"
+    }
+
+    It "Enforces case-sensitive VideoId matching" {
+        Mock ffprobe {
+            $global:LASTEXITCODE = 0
+            return '{"streams":[{"codec_type":"video","nb_read_packets":"100"}],"format":{"duration":"10.0"}}'
+        }
+
+        $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "aBc12345678" -Mode "Video")
+        $candidates.Count | Should -Be 0
+    }
+
+    It "Ignores files in subdirectories" {
+        Mock ffprobe {
+            $global:LASTEXITCODE = 0
+            return '{"streams":[{"codec_type":"video","nb_read_packets":"100"}],"format":{"duration":"10.0"}}'
+        }
+
+        $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "AbC12345678" -Mode "Video")
+        $foundInSubdir = $candidates | Where-Object { $_.File.DirectoryName -eq $script:SubDir }
+        $foundInSubdir | Should -BeNullOrEmpty
+    }
+
+    It "Correctly identifies OtherMode when checking Video mode on an Audio file" {
+        Mock ffprobe {
+            $global:LASTEXITCODE = 0
+            return '{"streams":[{"codec_type":"audio","nb_read_packets":"100"}],"format":{"duration":"10.0"}}'
+        }
+
+        $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "AbC12345678" -Mode "Video")
+        $audioCandidate = $candidates | Where-Object { $_.File.Name -eq "prefix_AbC12345678.mp3" }
+        $audioCandidate | Should -Not -BeNullOrEmpty
+        $audioCandidate.Verdict | Should -Be "OtherMode"
+    }
+
+    It "Returns empty array if directory does not exist" {
+        $candidates = @(Find-OutputCandidates -Directory "C:\NonExistentDir12345" -VideoId "AbC12345678" -Mode "Video")
+        $candidates.Count | Should -Be 0
+    }
+
+    It "Returns empty array if VideoId is empty" {
+        $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "" -Mode "Video")
+        $candidates.Count | Should -Be 0
+    }
+}
+
 }
