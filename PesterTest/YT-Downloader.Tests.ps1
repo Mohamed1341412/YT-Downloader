@@ -188,6 +188,7 @@ Describe "Phase 1: Execution and State Logic" {
             }
         }
         Mock Test-FileValidity { return $true }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
     }
 
     It "Exhausted element does not start new download (yt-dlp not invoked)" {
@@ -253,6 +254,7 @@ Describe "Phase 1: Execution and State Logic" {
         
         Invoke-ItemDownload -Item $item | Should -BeTrue
         Should -Invoke -CommandName yt-dlp -Times 2 -Exactly
+        $item.AttemptCount | Should -Be 2
         $item.Status | Should -Be "Success"
     }
 
@@ -755,6 +757,248 @@ Describe "Phase 3 - Delivery 1: Pure Helper Functions" {
     It "Returns empty array if VideoId is empty" {
         $candidates = @(Find-OutputCandidates -Directory $script:CandidateDir -VideoId "" -Mode "Video")
         $candidates.Count | Should -Be 0
+    }
+}
+
+Describe "Phase 3 - Delivery 3: Invoke-ItemDownload Corrupt/Unknown/OtherMode Handling" {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        
+        $script:AppDir = Join-Path $env:APPDATA "YT-DL-CLI"
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir "Logs") -Force | Out-Null
+        
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        
+        function global:yt-dlp { }
+        function global:ffprobe { }
+        
+        Mock Start-Sleep { }
+        Mock Remove-VideoIdFromArchive { return $true }
+        Mock Test-FileValidity { return $true }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "x"; Error = $null } }
+    }
+
+    AfterAll {
+        Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
+        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        $env:APPDATA = $script:OrigAppData
+    }
+
+    BeforeEach {
+        $script:Config.MaxRetries = 0 # maxAttempts = 1 for deterministic single-attempt tests
+        
+        $script:TestDest = Join-Path $TestDrive "TestDest"
+        if (-not (Test-Path $script:TestDest)) { New-Item -ItemType Directory -Path $script:TestDest -Force | Out-Null }
+        
+        $script:TestFile = Join-Path $script:TestDest "TestVideo_AbC12345678.mp4"
+        Set-Content -Path $script:TestFile -Value "dummy" -Force
+    }
+
+    It "Valid file (Case A): succeeds without isolation or archive modification" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "x"; Error = $null } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "Corrupt file (Case A): isolates successfully and cleans archive" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Corrupt"; Reason = "0 packets" } }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "$script:TestFile.invalid_123"; Error = $null } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "file was corrupt and isolated to"
+        Should -Invoke -CommandName Move-ToInvalid -Times 1 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
+    }
+
+    It "Corrupt file (Case B, Exit != 0): isolates successfully but DOES NOT clean archive" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 1
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Corrupt"; Reason = "Invalid data" } }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "$script:TestFile.invalid_123"; Error = $null } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "file was corrupt and isolated to"
+        Should -Invoke -CommandName Move-ToInvalid -Times 1 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "Corrupt file: isolation fails, archive untouched" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Corrupt"; Reason = "0 packets" } }
+        Mock Move-ToInvalid { return @{ Success = $false; NewPath = $null; Error = "disk full" } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "quarantine failed: disk full"
+        Should -Invoke -CommandName Move-ToInvalid -Times 1 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "Corrupt file: isolation succeeds but archive cleanup fails (Rule 6)" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Corrupt"; Reason = "0 packets" } }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "$script:TestFile.invalid_123"; Error = $null } }
+        Mock Remove-VideoIdFromArchive { return $false }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "archive cleanup failed"
+        $item.Error | Should -Match "isolated to"
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
+    }
+
+    It "Unknown verdict (Exit 0): fails without isolation or archive modification" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Unknown"; Reason = "ffprobe not found" } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "verdict Unknown: ffprobe not found"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "OtherMode verdict (Exit 0): fails without isolation or archive modification" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "OtherMode"; Reason = "Contains video stream" } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Audio"; MaxHeight=0; AudioFormat="MP3"; Bitrate=128; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "verdict OtherMode: Contains video stream"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "Case B (Exit != 0 with path): Valid verdict does not isolate, fails with exit code" {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 1
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "x"; Error = $null } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "yt-dlp exit code 1"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "MaxRetries=1: 1st attempt Corrupt, 2nd Valid -> Success, AttemptCount=2" {
+        $script:Config.MaxRetries = 1 # maxAttempts = 2
+        $script:verdictCallCount = 0
+        Mock Get-FileVerdict {
+            $script:verdictCallCount++
+            if ($script:verdictCallCount -eq 1) {
+                return @{ Verdict = "Corrupt"; Reason = "0 packets" }
+            } else {
+                return @{ Verdict = "Valid"; Reason = "OK" }
+            }
+        }
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:TestFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "$script:TestFile.invalid_123"; Error = $null } }
+        
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url="https://youtube.com/watch?v=AbC12345678"; Mode="Video"; MaxHeight=720; AudioFormat=""; Bitrate=0; Destination=$script:TestDest; Status="Pending"; Error=""; OutputFilePath=""; VideoId="AbC12345678"; RetryCount=0; AttemptCount=0 }
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.AttemptCount | Should -Be 2
+        Should -Invoke -CommandName Move-ToInvalid -Times 1 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
     }
 }
 

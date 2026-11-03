@@ -1195,6 +1195,7 @@ function Invoke-ItemDownload {
     $ytExitCode = -1
     $workingId = $expectedId
     $actualPath = ""
+    $lastSpecificError = ""
 
     while ([int]$Item.AttemptCount -lt $maxAttempts -and -not $downloadSucceeded) {
         $attemptNumber = [int]$Item.AttemptCount + 1
@@ -1213,6 +1214,7 @@ function Invoke-ItemDownload {
         $ytExitCode = -1
         $actualPath = ""
         $actualId = ""
+        $lastSpecificError = ""
         try {
             $idFile = [System.IO.Path]::GetTempFileName()
             $pathFile = [System.IO.Path]::GetTempFileName()
@@ -1251,10 +1253,50 @@ function Invoke-ItemDownload {
             try { $actualPath = [System.IO.Path]::GetFullPath($actualPath) } catch { $actualPath = "" }
         }
 
-        if ($ytExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($actualPath) -and (Test-FileValidity -FilePath $actualPath -Mode $Item.Mode)) {
-            $downloadSucceeded = $true
-            break
-        }
+         if (-not [string]::IsNullOrWhiteSpace($actualPath)) {
+         $verdict = Get-FileVerdict -FilePath $actualPath -Mode $Item.Mode
+         
+         if ($verdict.Verdict -eq 'Valid' -and $ytExitCode -eq 0) {
+             $downloadSucceeded = $true
+             break
+         }
+         
+         if ($verdict.Verdict -eq 'Corrupt') {
+             $moveResult = Move-ToInvalid -FilePath $actualPath -Directory $dest
+             if ($moveResult.Success) {
+                 if ($ytExitCode -eq 0) {
+                     if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
+                         $lastSpecificError = "archive cleanup failed (file isolated to $($moveResult.NewPath))"
+                     } else {
+                         $lastSpecificError = "file was corrupt and isolated to $($moveResult.NewPath)"
+                     }
+                 } else {
+                     $lastSpecificError = "file was corrupt and isolated to $($moveResult.NewPath)"
+                 }
+             } else {
+                 $lastSpecificError = "quarantine failed: $($moveResult.Error)"
+             }
+         }
+         elseif ($ytExitCode -eq 0 -and $verdict.Verdict -eq 'Unknown') {
+             $lastSpecificError = "verdict Unknown: $($verdict.Reason)"
+         }
+         elseif ($ytExitCode -eq 0 -and $verdict.Verdict -eq 'OtherMode') {
+             $lastSpecificError = "verdict OtherMode: $($verdict.Reason)"
+         }
+     }
+
+     if (-not [string]::IsNullOrWhiteSpace($lastSpecificError)) {
+         Write-Log "Attempt $attemptNumber failed: $lastSpecificError" "Red"
+         if ([int]$Item.AttemptCount -lt $maxAttempts) {
+             if (-not (Set-ItemState -Item $Item -Status "Pending" -Error $lastSpecificError -RetryCount $retryNumber -AttemptCount $attemptNumber)) {
+                 Write-Log "Cannot persist retry state; aborting this item." "Red"
+                 return $false
+             }
+             Write-Log "Attempt $attemptNumber failed. Waiting before retry..." "Yellow"
+             Start-Sleep -Seconds ([Math]::Min(2 * $attemptNumber, 10))
+         }
+         continue
+     }
 
         # yt-dlp may return success without a filepath when the item is already in the archive.
         if ($ytExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($actualPath)) {
@@ -1298,7 +1340,9 @@ function Invoke-ItemDownload {
         return $true
     }
 
-    if (-not (Set-ItemState -Item $Item -Status "Failed" -Error "yt-dlp exit code $ytExitCode; attempt budget $([int]$Item.AttemptCount)/$maxAttempts exhausted")) {
+    $finalError = if (-not [string]::IsNullOrWhiteSpace($lastSpecificError)) { "$lastSpecificError; attempt budget $([int]$Item.AttemptCount)/$maxAttempts exhausted" } else { "yt-dlp exit code $ytExitCode; attempt budget $([int]$Item.AttemptCount)/$maxAttempts exhausted" }
+
+    if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $finalError)) {
     Write-Log "CRITICAL: Failed to persist final failure state for $($Item.Url)." "Red"
 	}
 
