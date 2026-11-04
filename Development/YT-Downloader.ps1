@@ -68,6 +68,348 @@ function Get-MaxAttempts {
     return ([int]$script:Config.MaxRetries + 1)
 }
 
+function Get-InvalidTargetPath {
+    param(
+        [string]$FilePath,
+        [string]$Directory
+    )
+    $fileName = [System.IO.Path]::GetFileName($FilePath)
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $guidShort = [guid]::NewGuid().ToString().Substring(0, 8)
+    # المواصفة: <الاسم الكامل بالامتداد>.invalid_<ts>_<guid8>
+    $newFileName = "${fileName}.invalid_${timestamp}_${guidShort}"
+    return Join-Path $Directory $newFileName
+}
+
+function Get-MediaInfo {
+    param([string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path -LiteralPath $FilePath)) {
+        return @{ Success = $false; Error = "File not found"; IsCommandFailure = $false }
+    }
+    try {
+        $probeArgs = @(
+            "-v", "error",
+            "-count_packets",
+            "-show_entries", "stream=codec_type,nb_read_packets",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            $FilePath
+        )
+        $raw = & ffprobe @probeArgs 2>$null
+        $exitCode = $global:LASTEXITCODE
+        
+        # إذا فشل الأمر نفسه (exit code != 0) فهو Corrupt (ملف تالف)، وليس Unknown
+        if ($exitCode -ne 0) {
+            return @{ Success = $false; Error = "ffprobe exited with code $exitCode"; IsCommandFailure = $false }
+        }
+        
+        $jsonText = $raw -join [Environment]::NewLine
+        $data = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        
+        $hasVideo = $false; $videoPackets = 0
+        $hasAudio = $false; $audioPackets = 0
+        
+        if ($data.streams) {
+            foreach ($stream in $data.streams) {
+                if ($stream.codec_type -eq 'video') { 
+                    $hasVideo = $true
+                    $parsed = 0
+                    [int]::TryParse([string]$stream.nb_read_packets, [ref]$parsed) | Out-Null
+                    $videoPackets = $parsed
+                }
+                if ($stream.codec_type -eq 'audio') { 
+                    $hasAudio = $true
+                    $parsed = 0
+                    [int]::TryParse([string]$stream.nb_read_packets, [ref]$parsed) | Out-Null
+                    $audioPackets = $parsed
+                }
+            }
+        }
+        
+        $duration = 0.0
+        if ($data.format -and $data.format.duration) {
+            [double]::TryParse([string]$data.format.duration, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$duration) | Out-Null
+        }
+
+        return @{ 
+            Success = $true
+            Duration = $duration
+            HasVideo = $hasVideo
+            HasAudio = $hasAudio
+            VideoPackets = $videoPackets
+            AudioPackets = $audioPackets
+            Error = $null
+            IsCommandFailure = $false
+        }
+    }
+    catch [System.Management.Automation.CommandNotFoundException] {
+        return @{ Success = $false; Error = "ffprobe not found"; IsCommandFailure = $true }
+    }
+    catch {
+        # يشمل ذلك أخطاء JSON أو أي استثناء غير متوقع أثناء التنفيذ
+        return @{ Success = $false; Error = "Exception: $($_.Exception.Message)"; IsCommandFailure = $true }
+    }
+}
+
+function Get-FileVerdict {
+    param(
+        [string]$FilePath,
+        [ValidateSet("Video", "Audio")]
+        [string]$Mode
+    )
+    if ([string]::IsNullOrWhiteSpace($FilePath)) {
+        return @{ Verdict = "Corrupt"; Reason = "Empty file path" }
+    }
+    
+    $fileItem = Get-Item -LiteralPath $FilePath -ErrorAction SilentlyContinue
+    if (-not $fileItem -or $fileItem.PSIsContainer -or $fileItem.Length -le 0) {
+        return @{ Verdict = "Corrupt"; Reason = "File missing, is a directory, or zero length" }
+    }
+
+    $mediaInfo = Get-MediaInfo -FilePath $FilePath
+    
+    # Unknown فقط إذا كان ffprobe غير متاح أو حدث استثناء غير متوقع
+    if (-not $mediaInfo.Success -and $mediaInfo.IsCommandFailure) {
+        return @{ Verdict = "Unknown"; Reason = "ffprobe failed or unavailable: $($mediaInfo.Error)" }
+    }
+    
+    # إذا نجح تشغيل ffprobe لكنه أرجع خطأ في قراءة الملف، فهو تالف
+    if (-not $mediaInfo.Success -and -not $mediaInfo.IsCommandFailure) {
+        return @{ Verdict = "Corrupt"; Reason = "ffprobe failed to read file: $($mediaInfo.Error)" }
+    }
+
+    # إضافة شرط جديد: ملف بدون أي مسارات صوت أو فيديو يعتبر تالفاً لمنع اعتباره OtherMode وتركه مكانه
+    if (-not $mediaInfo.HasVideo -and -not $mediaInfo.HasAudio) {
+        return @{ Verdict = "Corrupt"; Reason = "No audio or video streams" }
+    }
+
+    # التحقق من أن المدة > 0
+    if ($mediaInfo.Duration -le 0) {
+        return @{ Verdict = "Corrupt"; Reason = "Invalid or zero duration" }
+    }
+
+    if ($Mode -eq "Video") {
+        if (-not $mediaInfo.HasVideo) {
+            return @{ Verdict = "OtherMode"; Reason = "No video stream found" }
+        }
+        if ($mediaInfo.VideoPackets -le 0) {
+            return @{ Verdict = "Corrupt"; Reason = "Video stream has 0 or negative packets" }
+        }
+        return @{ Verdict = "Valid"; Reason = "Valid video file" }
+    }
+    else { # Mode -eq "Audio"
+        if ($mediaInfo.HasVideo) {
+            return @{ Verdict = "OtherMode"; Reason = "Contains video stream (expected audio only)" }
+        }
+        if (-not $mediaInfo.HasAudio) {
+            return @{ Verdict = "OtherMode"; Reason = "No audio stream found" }
+        }
+        if ($mediaInfo.AudioPackets -le 0) {
+            return @{ Verdict = "Corrupt"; Reason = "Audio stream has 0 or negative packets" }
+        }
+        return @{ Verdict = "Valid"; Reason = "Valid audio file" }
+    }
+}
+
+function Test-PathInsideDirectory {
+    param(
+        [string]$Path,
+        [string]$Directory
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Directory)) {
+        return $false
+    }
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $fullDir = [System.IO.Path]::GetFullPath($Directory)
+        
+        if (-not $fullDir.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+            $fullDir += [System.IO.Path]::DirectorySeparatorChar
+        }
+        
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            return $false
+        }
+        
+        $parentDir = [System.IO.Path]::GetDirectoryName($fullPath)
+        if (-not $parentDir.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+            $parentDir += [System.IO.Path]::DirectorySeparatorChar
+        }
+        
+        return $parentDir.Equals($fullDir, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Move-ToInvalid {
+    param(
+        [string]$FilePath,
+        [string]$Directory
+    )
+    $result = @{ Success = $false; NewPath = $null; Error = $null }
+    
+    if (-not (Test-PathInsideDirectory -Path $FilePath -Directory $Directory)) {
+        $result.Error = "Path validation failed: File is not a direct child of the target directory or does not exist."
+        return $result
+    }
+
+    $maxRetries = 5
+    $lastError = ""
+    for ($i = 1; $i -le $maxRetries; $i++) {
+        try {
+            $newPath = Get-InvalidTargetPath -FilePath $FilePath -Directory $Directory
+            
+            # التحقق من عدم وجود تصادم في الاسم
+            if (Test-Path -LiteralPath $newPath) {
+                continue # تصادم، حاول مرة أخرى باسم جديد
+            }
+            
+            [System.IO.File]::Move($FilePath, $newPath)
+            $result.Success = $true
+            $result.NewPath = $newPath
+            return $result
+        }
+        catch [System.IO.IOException] {
+            $lastError = $_.Exception.Message
+            continue
+        }
+        catch {
+            $result.Error = "Move failed: $($_.Exception.Message)"
+            return $result
+        }
+    }
+    
+    $result.Error = "Move failed after $maxRetries attempts due to persistent naming collisions or file locks. Last error: $lastError"
+    return $result
+}
+
+function Find-OutputCandidates {
+    param(
+        [string]$Directory,
+        [string]$VideoId,
+        [ValidateSet("Video", "Audio")]
+        [string]$Mode
+    )
+    $candidates = @()
+    
+    if ([string]::IsNullOrWhiteSpace($Directory) -or [string]::IsNullOrWhiteSpace($VideoId)) {
+        return $candidates
+    }
+
+    try {
+        $fullDir = [System.IO.Path]::GetFullPath($Directory)
+        if (-not (Test-Path -LiteralPath $fullDir -PathType Container)) {
+            return $candidates
+        }
+    } catch {
+        return $candidates
+    }
+
+    $validExts = @('mp4', 'webm', 'mkv', 'mov', 'm4a', 'mp3', 'opus', 'ogg', 'aac', 'flac', 'wav')
+    
+    # جلب الملفات المباشرة فقط (بدون بحث متداخل)
+    $files = Get-ChildItem -LiteralPath $fullDir -File -ErrorAction SilentlyContinue
+    
+    foreach ($file in $files) {
+        $ext = [System.IO.Path]::GetExtension($file.Name).TrimStart('.').ToLowerInvariant()
+        
+        # 1. التحقق من الامتداد المسموح
+        if ($validExts -notcontains $ext) { continue }
+
+        # 2. استبعاد الأنماط المحظورة صراحةً
+        if ($file.Name -match '\.part$|\.ytdl$|\.invalid_|\.bak$|\.tmp$|\.f\d+\.|-Frag\d+\.part') {
+            continue
+        }
+
+        # 3. التحقق من مطابقة المعرّف (حساسة لحالة الحروف Case-Sensitive)
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $expectedSuffix = "_$VideoId"
+        if (-not $baseName.EndsWith($expectedSuffix, [System.StringComparison]::Ordinal)) {
+            continue
+        }
+
+        # 4. الحصول على الحكم المشدد للملف
+        $verdict = Get-FileVerdict -FilePath $file.FullName -Mode $Mode
+        
+        $candidates += [PSCustomObject]@{
+            File    = $file
+            Verdict = $verdict.Verdict
+            Reason  = $verdict.Reason
+        }
+    }
+
+    return $candidates
+}
+
+function Get-RetryPlan {
+    param(
+        [object]$Manifest = $script:Manifest
+    )
+    $maxAttempts = Get-MaxAttempts
+    $candidates = @()
+    
+    foreach ($m in $Manifest) {
+        $eligible = $false
+        if ($m.Status -in @("Failed", "Pending", "Downloading")) {
+            $eligible = $true
+        }
+        elseif ($m.Status -eq "Success" -and -not (Test-FileValidity -FilePath $m.OutputFilePath -Mode $m.Mode)) {
+            $eligible = $true
+        }
+        if ($eligible) { $candidates += $m }
+    }
+
+    if ($candidates.Count -eq 0) {
+        return @{ ModifiedManifest = $null; ItemsToRun = @() }
+    }
+
+    $tempManifest = Copy-Manifest -Source $Manifest
+    $toRun = @()
+    
+    foreach ($c in $candidates) {
+        $idx = -1
+        for ($i = 0; $i -lt $tempManifest.Count; $i++) {
+            if ([string]$tempManifest[$i].Id -eq [string]$c.Id) { $idx = $i; break }
+        }
+        if ($idx -lt 0) { continue }
+        
+        $entry = $tempManifest[$idx]
+        
+        # تصفير العدادات فقط إذا كان العنصر مستنفداً بالفعل
+        if ([int]$entry.AttemptCount -ge $maxAttempts) {
+            $entry.AttemptCount = 0
+            $entry.RetryCount = 0
+        }
+        
+        $vid = if ($entry.VideoId) { $entry.VideoId } else { Get-VideoId -Url $entry.Url }
+        if ([string]::IsNullOrWhiteSpace($vid)) {
+            $entry.Status = "Failed"
+            $entry.Error = "Invalid YouTube URL / VideoId"
+            continue
+        }
+        
+        $previousStatus = [string]$entry.Status
+        $entry.Status = "Pending"
+        $entry.Error = ""
+        $entry.VideoId = $vid
+        
+        if ($previousStatus -ne 'Success' -or -not (Test-FileValidity -FilePath $entry.OutputFilePath -Mode $entry.Mode)) {
+            $entry.OutputFilePath = ""
+        }
+        
+        $entry.RetryCount = [Math]::Min((Get-MaxAttempts) - 1, [Math]::Max(0, [int]$entry.AttemptCount - 1))
+        $toRun += $entry
+    }
+    
+    if ($toRun.Count -eq 0) {
+        return @{ ModifiedManifest = $null; ItemsToRun = @() }
+    }
+    
+    return @{ ModifiedManifest = $tempManifest; ItemsToRun = $toRun }
+}
+
 function Copy-Manifest {
     param([object]$Source)
     $copy = @()
@@ -853,6 +1195,7 @@ function Invoke-ItemDownload {
     $ytExitCode = -1
     $workingId = $expectedId
     $actualPath = ""
+    $lastSpecificError = ""
 
     while ([int]$Item.AttemptCount -lt $maxAttempts -and -not $downloadSucceeded) {
         $attemptNumber = [int]$Item.AttemptCount + 1
@@ -871,6 +1214,7 @@ function Invoke-ItemDownload {
         $ytExitCode = -1
         $actualPath = ""
         $actualId = ""
+        $lastSpecificError = ""
         try {
             $idFile = [System.IO.Path]::GetTempFileName()
             $pathFile = [System.IO.Path]::GetTempFileName()
@@ -909,10 +1253,55 @@ function Invoke-ItemDownload {
             try { $actualPath = [System.IO.Path]::GetFullPath($actualPath) } catch { $actualPath = "" }
         }
 
-        if ($ytExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($actualPath) -and (Test-FileValidity -FilePath $actualPath -Mode $Item.Mode)) {
-            $downloadSucceeded = $true
-            break
-        }
+         if (-not [string]::IsNullOrWhiteSpace($actualPath)) {
+         $verdict = Get-FileVerdict -FilePath $actualPath -Mode $Item.Mode
+         
+         if ($verdict.Verdict -eq 'Valid' -and $ytExitCode -eq 0) {
+             $downloadSucceeded = $true
+             break
+         }
+         
+         if ($verdict.Verdict -eq 'Corrupt') {
+             $moveResult = Move-ToInvalid -FilePath $actualPath -Directory $dest
+             if ($moveResult.Success) {
+                    if ($ytExitCode -eq 0) {
+                     if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
+                         $lastSpecificError = "archive cleanup failed (file isolated to $($moveResult.NewPath))"
+                         Write-Log "Archive cleanup failed after isolation: $($moveResult.NewPath). Halting immediately." "Red"
+                         if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $lastSpecificError)) {
+                             Write-Log "CRITICAL: Failed to persist failure state for $($Item.Url)." "Red"
+                         }
+                         return $false
+                     } else {
+                         $lastSpecificError = "file was corrupt and isolated to $($moveResult.NewPath)"
+                     }
+                 } else {
+                     $lastSpecificError = "file was corrupt and isolated to $($moveResult.NewPath)"
+                 }
+             } else {
+                 $lastSpecificError = "quarantine failed: $($moveResult.Error)"
+             }
+         }
+         elseif ($ytExitCode -eq 0 -and $verdict.Verdict -eq 'Unknown') {
+             $lastSpecificError = "verdict Unknown: $($verdict.Reason)"
+         }
+         elseif ($ytExitCode -eq 0 -and $verdict.Verdict -eq 'OtherMode') {
+             $lastSpecificError = "verdict OtherMode: $($verdict.Reason)"
+         }
+     }
+
+     if (-not [string]::IsNullOrWhiteSpace($lastSpecificError)) {
+         Write-Log "Attempt $attemptNumber failed: $lastSpecificError" "Red"
+         if ([int]$Item.AttemptCount -lt $maxAttempts) {
+             if (-not (Set-ItemState -Item $Item -Status "Pending" -Error $lastSpecificError -RetryCount $retryNumber -AttemptCount $attemptNumber)) {
+                 Write-Log "Cannot persist retry state; aborting this item." "Red"
+                 return $false
+             }
+             Write-Log "Attempt $attemptNumber failed. Waiting before retry..." "Yellow"
+             Start-Sleep -Seconds ([Math]::Min(2 * $attemptNumber, 10))
+         }
+         continue
+     }
 
         # yt-dlp may return success without a filepath when the item is already in the archive.
         if ($ytExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($actualPath)) {
@@ -922,21 +1311,102 @@ function Invoke-ItemDownload {
                 return $false
             }
             if ($archiveCheck.Status -eq 'Found') {
-                $suffix = "_$workingId"
-                $found = Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.BaseName.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase) } |
-                    Select-Object -First 1
-                if ($found -and (Test-FileValidity -FilePath $found.FullName -Mode $Item.Mode)) {
-                    $actualPath = [System.IO.Path]::GetFullPath($found.FullName)
-                    $downloadSucceeded = $true
-                    break
-                }
-                # Archive says it exists, but no valid output is present; remove the stale entry before retrying.
-                if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
-                    [void](Set-ItemState -Item $Item -Status "Failed" -Error "Archive cleanup failed")
-                    return $false
-                }
-            }
+             $candidates = @(Find-OutputCandidates -Directory $dest -VideoId $workingId -Mode $Item.Mode)
+             
+             $validCandidates = @($candidates | Where-Object { $_.Verdict -eq 'Valid' })
+             $unknownCandidates = @($candidates | Where-Object { $_.Verdict -eq 'Unknown' })
+             $corruptCandidates = @($candidates | Where-Object { $_.Verdict -eq 'Corrupt' })
+             $otherModeCandidates = @($candidates | Where-Object { $_.Verdict -eq 'OtherMode' })
+             
+             # Rule 1: Valid exists - accept without isolation
+             if ($validCandidates.Count -gt 0) {
+                 # Find the newest file by LastWriteTimeUtc, breaking ties by Ordinal name comparison
+                 $chosen = $null
+                 foreach ($c in $validCandidates) {
+                     if ($null -eq $chosen) {
+                         $chosen = $c
+                         continue
+                     }
+                     $timeCmp = $c.File.LastWriteTimeUtc.CompareTo($chosen.File.LastWriteTimeUtc)
+                     if ($timeCmp -gt 0) {
+                         $chosen = $c
+                     }
+                     elseif ($timeCmp -eq 0) {
+                         # Break ties using Ordinal comparison (smaller name wins)
+                         if ([System.StringComparer]::Ordinal.Compare($c.File.Name, $chosen.File.Name) -lt 0) {
+                             $chosen = $c
+                         }
+                     }
+                 }
+                 $actualPath = $chosen.File.FullName
+                 Write-Log "Found valid output for ${workingId}: $($chosen.File.Name)" "Cyan"
+                 $downloadSucceeded = $true
+                 break
+             }
+             
+             # Rule 2: Unknown has priority - no isolation, no archive modification
+             if ($unknownCandidates.Count -gt 0) {
+                 $lastSpecificError = "verdict Unknown: $($unknownCandidates[0].Reason)"
+             }
+             # Rule 3: Corrupt exists - isolate all, then remove ID
+             # Note: If isolation of the second file fails, the first file remains isolated.
+             # The archive is NOT modified in this case (per policy).
+             elseif ($corruptCandidates.Count -gt 0) {
+                 $isolationFailed = $false
+                 $firstIsolatedPath = $null
+                 foreach ($c in $corruptCandidates) {
+                     $moveResult = Move-ToInvalid -FilePath $c.File.FullName -Directory $dest
+                     if (-not $moveResult.Success) {
+                         $lastSpecificError = "quarantine failed: $($moveResult.Error)"
+                         $isolationFailed = $true
+                         break
+                     }
+                     if ($null -eq $firstIsolatedPath) { $firstIsolatedPath = $moveResult.NewPath }
+                 }
+                 if (-not $isolationFailed) {
+                     if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
+                         $lastSpecificError = "archive cleanup failed (file isolated to $firstIsolatedPath)"
+                         Write-Log "Archive cleanup failed after isolation: $firstIsolatedPath. Halting immediately." "Red"
+                         if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $lastSpecificError)) {
+                             Write-Log "CRITICAL: Failed to persist failure state for $($Item.Url)." "Red"
+                         }
+                         return $false
+                     }
+                     $lastSpecificError = "file was corrupt and isolated to $firstIsolatedPath"
+                 }
+             }
+             # Rule 4: OtherMode only or no candidates - remove ID, no isolation
+             else {
+                 if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
+                     $lastSpecificError = "Archive cleanup failed"
+                     Write-Log "Archive cleanup failed. Halting immediately." "Red"
+                     if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $lastSpecificError)) {
+                         Write-Log "CRITICAL: Failed to persist failure state for $($Item.Url)." "Red"
+                     }
+                     return $false
+                 }
+                 if ($otherModeCandidates.Count -gt 0) {
+                     $names = ($otherModeCandidates | ForEach-Object { $_.File.Name }) -join ', '
+                     $lastSpecificError = "no valid $($Item.Mode) output (only other-mode files: $names)"
+                 } else {
+                     $lastSpecificError = "no valid $($Item.Mode) output found"
+                 }
+             }
+             
+             # Handle retryable failure for rules 2, 3 (isolation failed), 4
+             if (-not [string]::IsNullOrWhiteSpace($lastSpecificError)) {
+                 Write-Log "Archive branch failed: $lastSpecificError" "Red"
+                 if ([int]$Item.AttemptCount -lt $maxAttempts) {
+                     if (-not (Set-ItemState -Item $Item -Status "Pending" -Error $lastSpecificError -RetryCount $retryNumber -AttemptCount $attemptNumber)) {
+                         Write-Log "Cannot persist retry state; aborting this item." "Red"
+                         return $false
+                     }
+                     Write-Log "Attempt $attemptNumber failed. Waiting before retry..." "Yellow"
+                     Start-Sleep -Seconds ([Math]::Min(2 * $attemptNumber, 10))
+                 }
+                 continue
+             }
+         }
         }
 
         if ([int]$Item.AttemptCount -lt $maxAttempts) {
@@ -956,7 +1426,9 @@ function Invoke-ItemDownload {
         return $true
     }
 
-    if (-not (Set-ItemState -Item $Item -Status "Failed" -Error "yt-dlp exit code $ytExitCode; attempt budget $([int]$Item.AttemptCount)/$maxAttempts exhausted")) {
+    $finalError = if (-not [string]::IsNullOrWhiteSpace($lastSpecificError)) { "$lastSpecificError; attempt budget $([int]$Item.AttemptCount)/$maxAttempts exhausted" } else { "yt-dlp exit code $ytExitCode; attempt budget $([int]$Item.AttemptCount)/$maxAttempts exhausted" }
+
+    if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $finalError)) {
     Write-Log "CRITICAL: Failed to persist final failure state for $($Item.Url)." "Red"
 	}
 
@@ -1239,67 +1711,16 @@ function Main {
                 }
             }
             "6" {
-                $maxAttempts = Get-MaxAttempts
-                $candidates = @()
-                foreach ($m in $script:Manifest) {
-                    $eligible = $false
-
-					if ($m.Status -in @("Failed", "Pending", "Downloading")) {
-						$eligible = $true
-					}
-					elseif (
-						$m.Status -eq "Success" -and
-						-not (Test-FileValidity -FilePath $m.OutputFilePath -Mode $m.Mode)
-					) {
-						$eligible = $true
-					}
-                    if ($eligible) { $candidates += $m }
-                }
-                if ($candidates.Count -eq 0) {
-                    Write-Log "No failed or interrupted items to retry." "Yellow"
+                $plan = Get-RetryPlan
+                if ($plan.ItemsToRun.Count -eq 0) {
+                    Write-Log "No eligible items to retry. The attempt budget may be exhausted or no failed items found." "Yellow"
                     Read-Host "Press Enter to continue"
                     continue
                 }
-                $tempManifest = Copy-Manifest -Source $script:Manifest
-                $toRun = @()
-                foreach ($c in $candidates) {
-                    $idx = -1
-                    for ($i = 0; $i -lt $tempManifest.Count; $i++) {
-                        if ([string]$tempManifest[$i].Id -eq [string]$c.Id) { $idx = $i; break }
-                    }
-                    if ($idx -lt 0) { continue }
-                    $entry = $tempManifest[$idx]
-                    if ([int]$entry.AttemptCount -ge $maxAttempts) {
-						# Explicit retry by the user starts a new attempt cycle.
-						$entry.AttemptCount = 0
-						$entry.RetryCount = 0
-					}
-                    $vid = if ($entry.VideoId) { $entry.VideoId } else { Get-VideoId -Url $entry.Url }
-                    if ([string]::IsNullOrWhiteSpace($vid)) {
-                        $entry.Status = "Failed"
-                        $entry.Error = "Invalid YouTube URL / VideoId"
-                        continue
-                    }
-                    # A Downloading item represents an attempt already started; resume with the next attempt.
-                    # AttemptCount is persisted before yt-dlp runs, so do not increment it here.
-                    $previousStatus = [string]$entry.Status
-                    $entry.Status = "Pending"
-                    $entry.Error = ""
-                    $entry.VideoId = $vid
-                    if ($previousStatus -ne 'Success' -or -not (Test-FileValidity -FilePath $entry.OutputFilePath -Mode $entry.Mode)) {
-                        $entry.OutputFilePath = ""
-                    }
-                    $entry.RetryCount = [Math]::Min((Get-MaxAttempts) - 1, [Math]::Max(0, [int]$entry.AttemptCount - 1))
-                    $toRun += $entry
-                }
-                if ($toRun.Count -eq 0) {
-                    Write-Log "No valid items remain eligible for retry." "Yellow"
-                    Read-Host "Press Enter to continue"
-                    continue
-                }
-                if (Save-AtomicJson -Path $script:ManifestPath -Data $tempManifest) {
-                    $script:Manifest = $tempManifest
-                    $itemsToRun = $toRun
+                
+                if (Save-AtomicJson -Path $script:ManifestPath -Data $plan.ModifiedManifest) {
+                    $script:Manifest = $plan.ModifiedManifest
+                    $itemsToRun = $plan.ItemsToRun
                     $isResume = $true
                 } else {
                     $script:RunState.ManifestSaved = $false

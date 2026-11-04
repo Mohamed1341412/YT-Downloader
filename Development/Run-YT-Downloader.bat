@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-set "SCRIPT=YT-Downloader-Dev.ps1"
+set "SCRIPT=YT-Downloader.ps1"
 set "SHELLEXE=powershell.exe"
 if /i "%~1"=="pwsh" set "SHELLEXE=pwsh.exe"
 
