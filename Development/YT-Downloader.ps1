@@ -1264,9 +1264,14 @@ function Invoke-ItemDownload {
          if ($verdict.Verdict -eq 'Corrupt') {
              $moveResult = Move-ToInvalid -FilePath $actualPath -Directory $dest
              if ($moveResult.Success) {
-                 if ($ytExitCode -eq 0) {
+                    if ($ytExitCode -eq 0) {
                      if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
                          $lastSpecificError = "archive cleanup failed (file isolated to $($moveResult.NewPath))"
+                         Write-Log "Archive cleanup failed after isolation: $($moveResult.NewPath). Halting immediately." "Red"
+                         if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $lastSpecificError)) {
+                             Write-Log "CRITICAL: Failed to persist failure state for $($Item.Url)." "Red"
+                         }
+                         return $false
                      } else {
                          $lastSpecificError = "file was corrupt and isolated to $($moveResult.NewPath)"
                      }
@@ -1306,21 +1311,102 @@ function Invoke-ItemDownload {
                 return $false
             }
             if ($archiveCheck.Status -eq 'Found') {
-                $suffix = "_$workingId"
-                $found = Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.BaseName.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase) } |
-                    Select-Object -First 1
-                if ($found -and (Test-FileValidity -FilePath $found.FullName -Mode $Item.Mode)) {
-                    $actualPath = [System.IO.Path]::GetFullPath($found.FullName)
-                    $downloadSucceeded = $true
-                    break
-                }
-                # Archive says it exists, but no valid output is present; remove the stale entry before retrying.
-                if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
-                    [void](Set-ItemState -Item $Item -Status "Failed" -Error "Archive cleanup failed")
-                    return $false
-                }
-            }
+             $candidates = @(Find-OutputCandidates -Directory $dest -VideoId $workingId -Mode $Item.Mode)
+             
+             $validCandidates = @($candidates | Where-Object { $_.Verdict -eq 'Valid' })
+             $unknownCandidates = @($candidates | Where-Object { $_.Verdict -eq 'Unknown' })
+             $corruptCandidates = @($candidates | Where-Object { $_.Verdict -eq 'Corrupt' })
+             $otherModeCandidates = @($candidates | Where-Object { $_.Verdict -eq 'OtherMode' })
+             
+             # Rule 1: Valid exists - accept without isolation
+             if ($validCandidates.Count -gt 0) {
+                 # Find the newest file by LastWriteTimeUtc, breaking ties by Ordinal name comparison
+                 $chosen = $null
+                 foreach ($c in $validCandidates) {
+                     if ($null -eq $chosen) {
+                         $chosen = $c
+                         continue
+                     }
+                     $timeCmp = $c.File.LastWriteTimeUtc.CompareTo($chosen.File.LastWriteTimeUtc)
+                     if ($timeCmp -gt 0) {
+                         $chosen = $c
+                     }
+                     elseif ($timeCmp -eq 0) {
+                         # Break ties using Ordinal comparison (smaller name wins)
+                         if ([System.StringComparer]::Ordinal.Compare($c.File.Name, $chosen.File.Name) -lt 0) {
+                             $chosen = $c
+                         }
+                     }
+                 }
+                 $actualPath = $chosen.File.FullName
+                 Write-Log "Found valid output for ${workingId}: $($chosen.File.Name)" "Cyan"
+                 $downloadSucceeded = $true
+                 break
+             }
+             
+             # Rule 2: Unknown has priority - no isolation, no archive modification
+             if ($unknownCandidates.Count -gt 0) {
+                 $lastSpecificError = "verdict Unknown: $($unknownCandidates[0].Reason)"
+             }
+             # Rule 3: Corrupt exists - isolate all, then remove ID
+             # Note: If isolation of the second file fails, the first file remains isolated.
+             # The archive is NOT modified in this case (per policy).
+             elseif ($corruptCandidates.Count -gt 0) {
+                 $isolationFailed = $false
+                 $firstIsolatedPath = $null
+                 foreach ($c in $corruptCandidates) {
+                     $moveResult = Move-ToInvalid -FilePath $c.File.FullName -Directory $dest
+                     if (-not $moveResult.Success) {
+                         $lastSpecificError = "quarantine failed: $($moveResult.Error)"
+                         $isolationFailed = $true
+                         break
+                     }
+                     if ($null -eq $firstIsolatedPath) { $firstIsolatedPath = $moveResult.NewPath }
+                 }
+                 if (-not $isolationFailed) {
+                     if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
+                         $lastSpecificError = "archive cleanup failed (file isolated to $firstIsolatedPath)"
+                         Write-Log "Archive cleanup failed after isolation: $firstIsolatedPath. Halting immediately." "Red"
+                         if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $lastSpecificError)) {
+                             Write-Log "CRITICAL: Failed to persist failure state for $($Item.Url)." "Red"
+                         }
+                         return $false
+                     }
+                     $lastSpecificError = "file was corrupt and isolated to $firstIsolatedPath"
+                 }
+             }
+             # Rule 4: OtherMode only or no candidates - remove ID, no isolation
+             else {
+                 if (-not (Remove-VideoIdFromArchive -ArchivePath $archive -VideoId $workingId)) {
+                     $lastSpecificError = "Archive cleanup failed"
+                     Write-Log "Archive cleanup failed. Halting immediately." "Red"
+                     if (-not (Set-ItemState -Item $Item -Status "Failed" -Error $lastSpecificError)) {
+                         Write-Log "CRITICAL: Failed to persist failure state for $($Item.Url)." "Red"
+                     }
+                     return $false
+                 }
+                 if ($otherModeCandidates.Count -gt 0) {
+                     $names = ($otherModeCandidates | ForEach-Object { $_.File.Name }) -join ', '
+                     $lastSpecificError = "no valid $($Item.Mode) output (only other-mode files: $names)"
+                 } else {
+                     $lastSpecificError = "no valid $($Item.Mode) output found"
+                 }
+             }
+             
+             # Handle retryable failure for rules 2, 3 (isolation failed), 4
+             if (-not [string]::IsNullOrWhiteSpace($lastSpecificError)) {
+                 Write-Log "Archive branch failed: $lastSpecificError" "Red"
+                 if ([int]$Item.AttemptCount -lt $maxAttempts) {
+                     if (-not (Set-ItemState -Item $Item -Status "Pending" -Error $lastSpecificError -RetryCount $retryNumber -AttemptCount $attemptNumber)) {
+                         Write-Log "Cannot persist retry state; aborting this item." "Red"
+                         return $false
+                     }
+                     Write-Log "Attempt $attemptNumber failed. Waiting before retry..." "Yellow"
+                     Start-Sleep -Seconds ([Math]::Min(2 * $attemptNumber, 10))
+                 }
+                 continue
+             }
+         }
         }
 
         if ([int]$Item.AttemptCount -lt $maxAttempts) {

@@ -883,7 +883,8 @@ Describe "Phase 3 - Delivery 3: Invoke-ItemDownload Corrupt/Unknown/OtherMode Ha
         Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
     }
 
-    It "Corrupt file: isolation succeeds but archive cleanup fails (Rule 6)" {
+    It "Corrupt file: isolation succeeds but archive cleanup fails (Rule 6) -> immediate halt" {
+        $script:Config.MaxRetries = 1
         Mock yt-dlp {
             $global:LASTEXITCODE = 0
             $i = [array]::IndexOf($args, '--print-to-file')
@@ -903,6 +904,7 @@ Describe "Phase 3 - Delivery 3: Invoke-ItemDownload Corrupt/Unknown/OtherMode Ha
         $item.Status | Should -Be "Failed"
         $item.Error | Should -Match "archive cleanup failed"
         $item.Error | Should -Match "isolated to"
+        Should -Invoke -CommandName yt-dlp -Times 1 -Exactly
         Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
     }
 
@@ -999,6 +1001,431 @@ Describe "Phase 3 - Delivery 3: Invoke-ItemDownload Corrupt/Unknown/OtherMode Ha
         $item.AttemptCount | Should -Be 2
         Should -Invoke -CommandName Move-ToInvalid -Times 1 -Exactly
         Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
+    }
+}
+Describe "Phase 3 - Delivery 4: Archive Branch (Case C) and Unified Cleanup Failure" {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        
+        $script:AppDir = Join-Path $env:APPDATA "YT-DL-CLI"
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir "Logs") -Force | Out-Null
+        
+        function global:yt-dlp { }
+        function global:ffprobe { }
+        
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        
+        Mock Start-Sleep { }
+        Mock Test-FileValidity { return $true }
+        Mock Test-IdInArchive { return @{ Status = 'Found' } }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
+        
+        # Helper functions moved to BeforeAll for reuse across tests
+        function script:New-TestItem {
+            param([string]$Status = "Pending", [int]$AttemptCount = 0)
+            [PSCustomObject]@{
+                Id = [guid]::NewGuid().ToString()
+                Url = "https://youtube.com/watch?v=AbC12345678"
+                Mode = "Video"
+                MaxHeight = 720
+                AudioFormat = ""
+                Bitrate = 0
+                Destination = $script:TestDest
+                Status = $Status
+                Error = ""
+                OutputFilePath = ""
+                VideoId = "AbC12345678"
+                RetryCount = 0
+                AttemptCount = $AttemptCount
+            }
+        }
+        
+        function script:New-Candidate {
+            param([string]$Name, [string]$Verdict, [datetime]$LastWriteTimeUtc, [string]$Reason = "")
+            $filePath = Join-Path $script:TestDest $Name
+            if (-not (Test-Path -LiteralPath $filePath)) {
+                Set-Content -Path $filePath -Value "dummy" -Force
+            }
+            $file = Get-Item -LiteralPath $filePath
+            $wrapper = [PSCustomObject]@{
+                FullName = $file.FullName
+                Name = $file.Name
+                LastWriteTimeUtc = $LastWriteTimeUtc
+            }
+            [PSCustomObject]@{
+                File = $wrapper
+                Verdict = $Verdict
+                Reason = $Reason
+            }
+        }
+    }
+
+    AfterAll {
+        Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
+        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        $env:APPDATA = $script:OrigAppData
+    }
+
+    BeforeEach {
+        $script:Config.MaxRetries = 0
+        
+        $script:TestDest = Join-Path $TestDrive "TestDest"
+        if (-not (Test-Path $script:TestDest)) { New-Item -ItemType Directory -Path $script:TestDest -Force | Out-Null }
+        
+        # yt-dlp exits 0 without writing a path (triggers archive branch)
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                # pathFile intentionally left empty to force archive branch
+            }
+        }
+    }
+
+    It "C-Rule1: Single Valid candidate -> success without isolation" {
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "video_AbC12345678.mp4" -Verdict "Valid" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { throw "Should not be called" }
+        Mock Remove-VideoIdFromArchive { throw "Should not be called" }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.OutputFilePath | Should -Match "video_AbC12345678\.mp4$"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "C-Rule1: Multiple Valid candidates -> newest wins" {
+        $script:oldTime = (Get-Date).ToUniversalTime().AddHours(-2)
+        $script:newTime = (Get-Date).ToUniversalTime()
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "old_AbC12345678.mp4" -Verdict "Valid" -LastWriteTimeUtc $script:oldTime),
+                (New-Candidate -Name "new_AbC12345678.mp4" -Verdict "Valid" -LastWriteTimeUtc $script:newTime)
+            )
+        }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.OutputFilePath | Should -Match "new_AbC12345678\.mp4$"
+    }
+
+    It "C-Rule1: Two Valid candidates with same LastWriteTimeUtc -> Ordinal name wins (B_ before a_)" {
+        # This test proves that Ordinal comparison is used, not CurrentCulture.
+        # In Ordinal, 'B' (0x42) < 'a' (0x61), so B_... should be chosen.
+        # We use B_ and a_ (not A_ and a_) because A_/a_ would be the same file on NTFS.
+        $script:sameTime = [datetime]::new(2024, 1, 1, 12, 0, 0, [DateTimeKind]::Utc)
+        
+        # Verify the Ordinal comparison expectation
+        [System.StringComparer]::Ordinal.Compare("B_AbC12345678.mp4", "a_AbC12345678.mp4") | Should -BeLessThan 0
+        
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "a_AbC12345678.mp4" -Verdict "Valid" -LastWriteTimeUtc $script:sameTime),
+                (New-Candidate -Name "B_AbC12345678.mp4" -Verdict "Valid" -LastWriteTimeUtc $script:sameTime)
+            )
+        }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.OutputFilePath | Should -Match "B_AbC12345678\.mp4$"
+    }
+
+    It "C-Rule1: Valid with Corrupt -> success, no isolation" {
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "valid_AbC12345678.mp4" -Verdict "Valid" -LastWriteTimeUtc (Get-Date).ToUniversalTime()),
+                (New-Candidate -Name "corrupt_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { throw "Should not be called" }
+        Mock Remove-VideoIdFromArchive { throw "Should not be called" }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "C-Rule3: Corrupt -> isolate, remove ID, then retry succeeds via path file (MaxRetries=1)" {
+        $script:Config.MaxRetries = 1
+        $script:callCount = 0
+        Mock yt-dlp {
+            $script:callCount++
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                if ($script:callCount -ge 2) {
+                    # Second attempt: write path file to trigger Case A with Valid verdict
+                    $script:TestFileRetry = Join-Path $script:TestDest "retry_AbC12345678.mp4"
+                    Set-Content -Path $script:TestFileRetry -Value "dummy" -Force
+                    $script:TestFileRetry | Out-File -FilePath $args[$i+5] -Encoding UTF8
+                }
+            }
+        }
+        Mock Find-OutputCandidates {
+            # Only called in first attempt (archive branch)
+            return @(
+                (New-Candidate -Name "corrupt_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "corrupt_AbC12345678.mp4.invalid_123"; Error = $null } }
+        Mock Remove-VideoIdFromArchive { return $true }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.AttemptCount | Should -Be 2
+        Should -Invoke -CommandName yt-dlp -Times 2 -Exactly
+        Should -Invoke -CommandName Find-OutputCandidates -Times 1 -Exactly
+        Should -Invoke -CommandName Move-ToInvalid -Times 1 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
+    }
+
+    It "C-Rule3: Corrupt with isolation failure -> archive untouched" {
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "corrupt_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { return @{ Success = $false; NewPath = $null; Error = "disk full" } }
+        Mock Remove-VideoIdFromArchive { throw "Should not be called" }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "quarantine failed: disk full"
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+        It "C-Rule3: Partial isolation (first succeeds, second fails) -> archive untouched" {
+        $script:moveCallCount = 0
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "corrupt1_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime()),
+                (New-Candidate -Name "corrupt2_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid {
+            $script:moveCallCount++
+            if ($script:moveCallCount -eq 1) {
+                return @{ Success = $true; NewPath = "corrupt1.invalid_123"; Error = $null }
+            }
+            return @{ Success = $false; NewPath = $null; Error = "disk full on second" }
+        }
+        Mock Remove-VideoIdFromArchive { throw "Should not be called" }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "quarantine failed: disk full on second"
+        Should -Invoke -CommandName Move-ToInvalid -Times 2 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "C-Rule2: Unknown only -> no isolation, no archive modification" {
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "unknown_AbC12345678.mp4" -Verdict "Unknown" -LastWriteTimeUtc (Get-Date).ToUniversalTime() -Reason "ffprobe not found")
+            )
+        }
+        Mock Move-ToInvalid { throw "Should not be called" }
+        Mock Remove-VideoIdFromArchive { throw "Should not be called" }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "verdict Unknown: ffprobe not found"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "C-Rule2: Unknown with Corrupt -> Unknown has priority, no isolation" {
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "unknown_AbC12345678.mp4" -Verdict "Unknown" -LastWriteTimeUtc (Get-Date).ToUniversalTime() -Reason "ffprobe crashed"),
+                (New-Candidate -Name "corrupt_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { throw "Should not be called" }
+        Mock Remove-VideoIdFromArchive { throw "Should not be called" }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "verdict Unknown: ffprobe crashed"
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 0 -Exactly
+    }
+
+    It "C-Rule4: OtherMode only -> remove ID, then retry succeeds via path file (MaxRetries=1)" {
+        $script:Config.MaxRetries = 1
+        $script:callCount = 0
+        Mock yt-dlp {
+            $script:callCount++
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                if ($script:callCount -ge 2) {
+                    $script:TestFileRetry = Join-Path $script:TestDest "retry_AbC12345678.mp4"
+                    Set-Content -Path $script:TestFileRetry -Value "dummy" -Force
+                    $script:TestFileRetry | Out-File -FilePath $args[$i+5] -Encoding UTF8
+                }
+            }
+        }
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "audio_AbC12345678.mp3" -Verdict "OtherMode" -LastWriteTimeUtc (Get-Date).ToUniversalTime() -Reason "Contains audio only")
+            )
+        }
+        Mock Move-ToInvalid { throw "Should not be called" }
+        Mock Remove-VideoIdFromArchive { return $true }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.AttemptCount | Should -Be 2
+        Should -Invoke -CommandName yt-dlp -Times 2 -Exactly
+        Should -Invoke -CommandName Find-OutputCandidates -Times 1 -Exactly
+        Should -Invoke -CommandName Move-ToInvalid -Times 0 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
+    }
+
+    It "C-Rule4: No candidates -> remove ID, then retry succeeds via path file (MaxRetries=1)" {
+        $script:Config.MaxRetries = 1
+        $script:callCount = 0
+        Mock yt-dlp {
+            $script:callCount++
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                "AbC12345678" | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                if ($script:callCount -ge 2) {
+                    $script:TestFileRetry = Join-Path $script:TestDest "retry_AbC12345678.mp4"
+                    Set-Content -Path $script:TestFileRetry -Value "dummy" -Force
+                    $script:TestFileRetry | Out-File -FilePath $args[$i+5] -Encoding UTF8
+                }
+            }
+        }
+        Mock Find-OutputCandidates { return @() }
+        Mock Remove-VideoIdFromArchive { return $true }
+        Mock Get-FileVerdict { return @{ Verdict = "Valid"; Reason = "OK" } }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status | Should -Be "Success"
+        $item.AttemptCount | Should -Be 2
+        Should -Invoke -CommandName yt-dlp -Times 2 -Exactly
+        Should -Invoke -CommandName Find-OutputCandidates -Times 1 -Exactly
+        Should -Invoke -CommandName Remove-VideoIdFromArchive -Times 1 -Exactly
+    }
+
+    It "C-ReadError: preserves existing behavior" {
+        Mock Test-IdInArchive { return @{ Status = 'ReadError' } }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Be "Archive read error"
+    }
+
+    It "C-Rule3: Corrupt isolation succeeds but archive cleanup fails -> Failed immediately (MaxRetries=1)" {
+        $script:Config.MaxRetries = 1
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "corrupt_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "corrupt_AbC12345678.mp4.invalid_123"; Error = $null } }
+        Mock Remove-VideoIdFromArchive { return $false }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Match "archive cleanup failed"
+        $item.Error | Should -Match "isolated to"
+        Should -Invoke -CommandName yt-dlp -Times 1 -Exactly
+    }
+
+    It "C-Rule4: OtherMode only with archive cleanup failure -> Failed immediately (MaxRetries=1)" {
+        $script:Config.MaxRetries = 1
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "audio_AbC12345678.mp3" -Verdict "OtherMode" -LastWriteTimeUtc (Get-Date).ToUniversalTime() -Reason "Contains audio only")
+            )
+        }
+        Mock Remove-VideoIdFromArchive { return $false }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.Status | Should -Be "Failed"
+        $item.Error | Should -Be "Archive cleanup failed"
+        Should -Invoke -CommandName yt-dlp -Times 1 -Exactly
+    }
+
+        It "C-Rule3: Set-ItemState failure during archive cleanup logs CRITICAL" {
+        $script:Config.MaxRetries = 0
+        Mock Find-OutputCandidates {
+            return @(
+                (New-Candidate -Name "corrupt_AbC12345678.mp4" -Verdict "Corrupt" -LastWriteTimeUtc (Get-Date).ToUniversalTime())
+            )
+        }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = "corrupt.invalid_123"; Error = $null } }
+        Mock Remove-VideoIdFromArchive { return $false }
+        Mock Write-Log { }
+        Mock Set-ItemState {
+            if ($Status -eq "Failed") { return $false }
+            return $true
+        }
+        
+        $item = New-TestItem
+        $script:Manifest = @($item)
+        
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        # Status remains unchanged because Set-ItemState is mocked
+        Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter { $Message -like 'CRITICAL*' }
     }
 }
 
