@@ -1,0 +1,23 @@
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: no-network
+# args: --simulate https://www.youtube.com/watch?v=AepZZKeGzyc
+# exit code: 1
+---
+[youtube] Extracting URL: https://www.youtube.com/watch?v=AepZZKeGzyc
+[youtube] AepZZKeGzyc: Downloading webpage
+WARNING: [youtube] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (1/3)...
+[youtube] AepZZKeGzyc: Downloading webpage
+WARNING: [youtube] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (2/3)...
+[youtube] AepZZKeGzyc: Downloading webpage
+WARNING: [youtube] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (3/3)...
+[youtube] AepZZKeGzyc: Downloading webpage
+WARNING: [youtube] AepZZKeGzyc: Unable to download webpage: HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed) (caused by TransportError("HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed)")). Giving up after 3 retries
+[youtube] AepZZKeGzyc: Downloading initial data API JSON
+WARNING: [youtube] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (1/3)...
+[youtube] AepZZKeGzyc: Downloading initial data API JSON
+WARNING: [youtube] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (2/3)...
+[youtube] AepZZKeGzyc: Downloading initial data API JSON
+WARNING: [youtube] HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (3/3)...
+[youtube] AepZZKeGzyc: Downloading initial data API JSON
+ERROR: [youtube] AepZZKeGzyc: Unable to download API page: HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed) (caused by TransportError("HTTPSConnection(host='www.youtube.com', port=443): Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed)"))

@@ -1,0 +1,10 @@
+# source: local simulated server
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: http-500
+# args: http://localhost:8765/500.mp4
+# exit code: 1
+---
+[generic] Extracting URL: http://localhost:8765/500.mp4
+[generic] 500: Downloading webpage
+ERROR: [generic] 500: Unable to download webpage: HTTP Error 500: Internal Server Error (caused by <HTTPError 500: Internal Server Error>)

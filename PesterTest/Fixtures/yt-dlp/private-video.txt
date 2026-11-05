@@ -1,0 +1,10 @@
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: private-video
+# args: --simulate https://youtu.be/kbU9srpmdxw
+# exit code: 1
+---
+[youtube] Extracting URL: https://youtu.be/kbU9srpmdxw
+[youtube] kbU9srpmdxw: Downloading webpage
+[youtube] kbU9srpmdxw: Downloading visionos player API JSON
+ERROR: [youtube] kbU9srpmdxw: Private video

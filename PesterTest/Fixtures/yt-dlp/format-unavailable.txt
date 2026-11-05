@@ -1,0 +1,11 @@
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: format-unavailable
+# args: --simulate -f 999999 https://www.youtube.com/watch?v=AepZZKeGzyc
+# exit code: 1
+---
+[youtube] Extracting URL: https://www.youtube.com/watch?v=AepZZKeGzyc
+[youtube] AepZZKeGzyc: Downloading webpage
+[youtube] AepZZKeGzyc: Downloading visionos player API JSON
+[youtube] AepZZKeGzyc: Downloading m3u8 information
+ERROR: [youtube] AepZZKeGzyc: Requested format is not available. Use --list-formats for a list of available formats

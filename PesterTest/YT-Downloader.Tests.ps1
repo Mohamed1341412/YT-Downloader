@@ -1429,4 +1429,255 @@ Describe "Phase 3 - Delivery 4: Archive Branch (Case C) and Unified Cleanup Fail
     }
 }
 
+Describe "Phase 4 - Delivery 1: Get-FailureKind" {
+    BeforeDiscovery {
+        $fixturesDirD = Join-Path $PSScriptRoot 'Fixtures\yt-dlp'
+        $expectedTable = @{
+            'success-baseline' = @{ FailureKind = 'None'; RetryDecision = 'None' }
+            'private-video' = @{ FailureKind = 'Permanent'; RetryDecision = 'Stop' }
+            'invalid-id-truncated' = @{ FailureKind = 'Permanent'; RetryDecision = 'Stop' }
+            'age-restricted' = @{ FailureKind = 'Configuration'; RetryDecision = 'Stop' }
+            'format-unavailable' = @{ FailureKind = 'Configuration'; RetryDecision = 'Stop' }
+            'bad-option' = @{ FailureKind = 'Configuration'; RetryDecision = 'Stop' }
+            'deleted-video' = @{ FailureKind = 'Unknown'; RetryDecision = 'Retry' }
+            'nonexistent-id' = @{ FailureKind = 'Unknown'; RetryDecision = 'Retry' }
+            'no-network' = @{ FailureKind = 'Transient'; RetryDecision = 'Retry' }
+            'http-429' = @{ FailureKind = 'Transient'; RetryDecision = 'Retry' }
+            'http-500' = @{ FailureKind = 'Transient'; RetryDecision = 'Retry' }
+            'http-503' = @{ FailureKind = 'Transient'; RetryDecision = 'Retry' }
+            'http-404' = @{ FailureKind = 'Unknown'; RetryDecision = 'Retry' }
+        }
+        
+        $cases = @()
+        foreach ($file in (Get-ChildItem -LiteralPath $fixturesDirD -Filter '*.txt' -File)) {
+            $content = Get-Content -LiteralPath $file.FullName -Encoding UTF8 -Raw
+            $lines = $content -split '\r?\n'
+            $headerEndIndex = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^---\s*$') {
+                    $headerEndIndex = $i
+                    break
+                }
+            }
+            if ($headerEndIndex -lt 0) { continue }
+            
+            $header = ($lines[0..($headerEndIndex-1)]) -join "`n"
+            $body = ($lines[($headerEndIndex+1)..($lines.Count-1)]) -join "`n"
+            
+            $exitCodeMatch = [regex]::Match($header, 'exit code:\s*(-?\d+)')
+            if (-not $exitCodeMatch.Success) { continue }
+            $exitCode = [int]$exitCodeMatch.Groups[1].Value
+            
+            $caseName = $file.BaseName
+            if ($expectedTable.ContainsKey($caseName)) {
+                $cases += @{
+                    CaseName = $caseName
+                    ExitCode = $exitCode
+                    ErrorText = @($body)
+                    Expected = $expectedTable[$caseName]
+                }
+            }
+        }
+        
+        $guardData = @(@{
+            ExpectedNames = @($expectedTable.Keys)
+            ActualNames = @(Get-ChildItem -LiteralPath $fixturesDirD -Filter '*.txt' -File | ForEach-Object { $_.BaseName })
+        })
+    }
+    
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        
+        $script:AppDir = Join-Path $env:APPDATA "YT-DL-CLI"
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir "Logs") -Force | Out-Null
+        
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+    }
+
+    AfterAll {
+        $env:APPDATA = $script:OrigAppData
+    }
+    
+    Context "Fixture-based tests" {
+        It "Fixture <CaseName> matches expected classification" -ForEach $cases {
+            param($CaseName, $ExitCode, $ErrorText, $Expected)
+            
+            $result = Get-FailureKind -ExitCode $ExitCode -ErrorText $ErrorText
+            $result.FailureKind | Should -Be $Expected.FailureKind
+            $result.RetryDecision | Should -Be $Expected.RetryDecision
+        }
+        
+        It "Fixture invariants: Permanent/Configuration -> Stop, Transient/Unknown -> Retry, None -> None" -ForEach $cases {
+            param($CaseName, $ExitCode, $ErrorText, $Expected)
+            
+            $result = Get-FailureKind -ExitCode $ExitCode -ErrorText $ErrorText
+            
+            if ($result.FailureKind -in @('Permanent', 'Configuration')) {
+                $result.RetryDecision | Should -Be 'Stop'
+            }
+            elseif ($result.FailureKind -in @('Transient', 'Unknown')) {
+                $result.RetryDecision | Should -Be 'Retry'
+            }
+            elseif ($result.FailureKind -eq 'None') {
+                $result.RetryDecision | Should -Be 'None'
+            }
+        }
+    }
+    
+    Context "Synthetic tests" {
+        It "Exit 0 returns None/None without analyzing text" {
+            $errorText = @("ERROR: [youtube] abc: Private video")
+            $result = Get-FailureKind -ExitCode 0 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'None'
+            $result.RetryDecision | Should -Be 'None'
+        }
+        
+        It "Exit 2 with parser error returns Configuration/Stop" {
+            $errorText = @("yt-dlp.exe: error: no such option: --invalid")
+            $result = Get-FailureKind -ExitCode 2 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Configuration'
+            $result.RetryDecision | Should -Be 'Stop'
+            $result.Reason | Should -Be 'invalid yt-dlp option'
+        }
+        
+        It "Exit 2 without parser error returns Unknown/Retry" {
+            $errorText = @("Some random error")
+            $result = Get-FailureKind -ExitCode 2 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "Exit 1 with parser error line returns Unknown/Retry" {
+            $errorText = @("yt-dlp.exe: error: no such option: --invalid")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "Exit -1 returns Unknown/Retry" {
+            $result = Get-FailureKind -ExitCode -1 -ErrorText @()
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "Exit 100 returns Unknown/Retry" {
+            $result = Get-FailureKind -ExitCode 100 -ErrorText @()
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "Null ErrorText returns Unknown/Retry" {
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $null
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "Empty ErrorText array returns Unknown/Retry" {
+            $result = Get-FailureKind -ExitCode 1 -ErrorText @()
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "WARNING lines are ignored in classification" {
+            $errorText = @(
+                "WARNING: [youtube] Some warning",
+                "WARNING: [youtube] Another warning",
+                "ERROR: [youtube] abc: Private video"
+            )
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Permanent'
+            $result.RetryDecision | Should -Be 'Stop'
+        }
+        
+        It "Case-insensitive matching works" {
+            $errorText = @("ERROR: [youtube] abc: PRIVATE VIDEO")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Permanent'
+            $result.RetryDecision | Should -Be 'Stop'
+        }
+        
+        It "Evidence length is truncated to 300 characters" {
+            $fixtureFile = Join-Path $PSScriptRoot "Fixtures\yt-dlp\age-restricted.txt"
+            $content = Get-Content -LiteralPath $fixtureFile -Encoding UTF8 -Raw
+            $lines = $content -split '\r?\n'
+            $headerEndIndex = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^---\s*$') {
+                    $headerEndIndex = $i
+                    break
+                }
+            }
+            $body = ($lines[($headerEndIndex+1)..($lines.Count-1)]) -join "`n"
+            
+            $result = Get-FailureKind -ExitCode 1 -ErrorText @($body)
+            $result.Evidence.Length | Should -BeLessOrEqual 300
+        }
+        
+        It "ID with hyphen is correctly matched for Private video" {
+            $errorText = @("ERROR: [youtube] abcdefghij-: Private video")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Permanent'
+            $result.RetryDecision | Should -Be 'Stop'
+        }
+        
+        It "Weak pattern: Private video + Video unavailable returns Permanent/Stop (no conflict)" {
+            $errorText = @("ERROR: [youtube] abc: Private video. Video unavailable")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Permanent'
+            $result.RetryDecision | Should -Be 'Stop'
+        }
+        
+        It "Weak pattern: TransportError + HTTP Error 404 returns Transient/Retry (no conflict)" {
+            $errorText = @("ERROR: [youtube] abc: TransportError. HTTP Error 404: Not Found")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Transient'
+            $result.RetryDecision | Should -Be 'Retry'
+        }
+        
+        It "Real conflict: Private video + HTTP Error 429 returns Unknown/Retry" {
+            $errorText = @("ERROR: [youtube] abc: Private video. HTTP Error 429: Too Many Requests")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Unknown'
+            $result.RetryDecision | Should -Be 'Retry'
+            $result.Reason | Should -Be 'conflicting evidence'
+        }
+        
+        It "Embedded newlines in array element are split correctly" {
+            $errorText = @("WARNING: test`r`nERROR: [youtube] abc: Private video")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Permanent'
+            $result.RetryDecision | Should -Be 'Stop'
+        }
+        
+        It "ANSI escape codes are removed before pattern matching" {
+            $errorText = @("ERROR: [youtube] abc: $([char]27)[31mPrivate video$([char]27)[0m")
+            $result = Get-FailureKind -ExitCode 1 -ErrorText $errorText
+            $result.FailureKind | Should -Be 'Permanent'
+            $result.RetryDecision | Should -Be 'Stop'
+        }
+        
+        It "ExitCode parameter is mandatory" {
+            $attr = (Get-Command Get-FailureKind).Parameters['ExitCode'].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] }
+            $attr.Mandatory | Should -BeTrue
+        }
+    }
+    
+    Context "Fixture guard" {
+        It "All fixtures have expected classifications and no extras" -ForEach $guardData {
+            param($ExpectedNames, $ActualNames)
+            
+            foreach ($expected in $ExpectedNames) {
+                $ActualNames | Should -Contain $expected
+            }
+            
+            foreach ($actual in $ActualNames) {
+                $ExpectedNames | Should -Contain $actual
+            }
+        }
+    }
+}
+
 }

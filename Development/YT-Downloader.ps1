@@ -285,6 +285,220 @@ function Move-ToInvalid {
     return $result
 }
 
+function Get-FailureKind {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [int]$ExitCode,
+        
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [string[]]$ErrorText
+    )
+    
+    # Initialize result
+    $result = @{
+        FailureKind   = 'Unknown'
+        RetryDecision = 'Retry'
+        Reason        = 'unknown failure'
+        Evidence      = ''
+    }
+    
+    # Exit 0: Success baseline - no analysis
+    if ($ExitCode -eq 0) {
+        $result.FailureKind = 'None'
+        $result.RetryDecision = 'None'
+        $result.Reason = 'success'
+        return $result
+    }
+    
+    # Exit 2: Bad option - requires both exit code AND parser error line
+    if ($ExitCode -eq 2) {
+        $hasParserError = $false
+        $parserLine = ''
+        
+        if ($null -ne $ErrorText -and $ErrorText.Count -gt 0) {
+            $allLines = @()
+            foreach ($element in $ErrorText) {
+                if (-not [string]::IsNullOrEmpty($element)) {
+                    $allLines += $element -split '\r?\n'
+                }
+            }
+            
+            foreach ($line in $allLines) {
+                $cleanLine = $line -replace '\x1b\[[0-9;]*m', ''
+                if ($cleanLine -match '^yt-dlp(?:\.exe)?:\s*error:') {
+                    $hasParserError = $true
+                    $parserLine = $cleanLine
+                    break
+                }
+            }
+        }
+        
+        if ($hasParserError) {
+            $result.FailureKind = 'Configuration'
+            $result.RetryDecision = 'Stop'
+            $result.Reason = 'invalid yt-dlp option'
+            $result.Evidence = $parserLine
+            if ($result.Evidence.Length -gt 300) {
+                $result.Evidence = $result.Evidence.Substring(0, 300)
+            }
+            return $result
+        }
+        # Exit 2 without parser error: fall through to default Unknown/Retry
+    }
+    
+    # Exit 1: Analyze last ERROR: line
+    if ($ExitCode -eq 1) {
+        $errorLines = @()
+        $warningLines = @()
+        
+        if ($null -ne $ErrorText -and $ErrorText.Count -gt 0) {
+            $allLines = @()
+            foreach ($element in $ErrorText) {
+                if (-not [string]::IsNullOrEmpty($element)) {
+                    $allLines += $element -split '\r?\n'
+                }
+            }
+            
+            foreach ($line in $allLines) {
+                $cleanLine = $line -replace '\x1b\[[0-9;]*m', ''
+                if ($cleanLine -match '^ERROR:') {
+                    $errorLines += $cleanLine
+                }
+                elseif ($cleanLine -match '^WARNING:') {
+                    $warningLines += $cleanLine
+                }
+            }
+        }
+        
+        if ($errorLines.Count -eq 0) {
+            # No ERROR: line found
+            if ($warningLines.Count -gt 0) {
+                $result.Evidence = ($warningLines -join ' | ')
+                if ($result.Evidence.Length -gt 300) {
+                    $result.Evidence = $result.Evidence.Substring(0, 300)
+                }
+            }
+            return $result
+        }
+        
+        $lastError = $errorLines[-1]
+        
+        # Detect patterns - categorize as critical or weak
+        $patterns = @{
+            Permanent = @()
+            Configuration = @()
+            Transient = @()
+            Weak = @()  # Patterns that don't participate in conflict detection
+        }
+        
+        # Permanent patterns - Fixed: \S+ instead of \w+ to support IDs with hyphens
+        if ($lastError -match '(?i)\S+:\s+Private video\b') {
+            $patterns.Permanent += @{ Pattern = 'Private video'; Reason = 'private video' }
+        }
+        if ($lastError -match '(?i)Incomplete YouTube ID' -and $lastError -match '(?i)looks truncated') {
+            $patterns.Permanent += @{ Pattern = 'Incomplete YouTube ID'; Reason = 'invalid video id' }
+        }
+        
+        # Configuration patterns
+        if ($lastError -match '(?i)Sign in to confirm your age') {
+            $patterns.Configuration += @{ Pattern = 'age restricted'; Reason = 'age restricted' }
+        }
+        if ($lastError -match '(?i)Requested format is not available') {
+            $patterns.Configuration += @{ Pattern = 'format unavailable'; Reason = 'format unavailable' }
+        }
+        
+        # Transient patterns
+        if ($lastError -match '(?i)TransportError') {
+            $patterns.Transient += @{ Pattern = 'TransportError'; Reason = 'network transport error' }
+        }
+        if ($lastError -match '(?i)getaddrinfo failed') {
+            $patterns.Transient += @{ Pattern = 'getaddrinfo failed'; Reason = 'network transport error' }
+        }
+        if ($lastError -match '(?i)Failed to resolve') {
+            $patterns.Transient += @{ Pattern = 'Failed to resolve'; Reason = 'network transport error' }
+        }
+        if ($lastError -match '(?i)HTTP Error 429') {
+            $patterns.Transient += @{ Pattern = 'HTTP Error 429'; Reason = 'http 429' }
+        }
+        if ($lastError -match '(?i)HTTP Error 5\d\d') {
+            $patterns.Transient += @{ Pattern = 'HTTP Error 5xx'; Reason = 'http 5xx' }
+        }
+        
+        # Weak patterns (don't participate in conflict detection)
+        if ($lastError -match '(?i)HTTP Error 4\d\d' -and $lastError -notmatch '(?i)HTTP Error 429') {
+            $patterns.Weak += @{ Pattern = 'HTTP Error 4xx'; Reason = 'unknown failure' }
+        }
+        if ($lastError -match '(?i)\bVideo unavailable\b' -and $lastError -notmatch '(?i)\bThis video is unavailable\b') {
+            $patterns.Weak += @{ Pattern = 'Video unavailable'; Reason = 'unknown failure' }
+        }
+        if ($lastError -match '(?i)\bThis video is unavailable\b') {
+            $patterns.Weak += @{ Pattern = 'This video is unavailable'; Reason = 'unknown failure' }
+        }
+        
+        # Count total critical matches
+        $totalCritical = $patterns.Permanent.Count + $patterns.Configuration.Count + $patterns.Transient.Count
+        
+        # Conflict detection: only among critical categories
+        if ($totalCritical -gt 1) {
+            # Multiple critical patterns from different categories = conflict
+            $categories = @()
+            if ($patterns.Permanent.Count -gt 0) { $categories += 'Permanent' }
+            if ($patterns.Configuration.Count -gt 0) { $categories += 'Configuration' }
+            if ($patterns.Transient.Count -gt 0) { $categories += 'Transient' }
+            
+            if ($categories.Count -gt 1) {
+                # Conflict detected
+                $result.FailureKind = 'Unknown'
+                $result.RetryDecision = 'Retry'
+                $result.Reason = 'conflicting evidence'
+                $result.Evidence = $lastError
+                if ($result.Evidence.Length -gt 300) {
+                    $result.Evidence = $result.Evidence.Substring(0, 300)
+                }
+                return $result
+            }
+        }
+        
+        # No conflict: apply priority within category
+        if ($patterns.Permanent.Count -gt 0) {
+            $result.FailureKind = 'Permanent'
+            $result.RetryDecision = 'Stop'
+            $result.Reason = $patterns.Permanent[0].Reason
+        }
+        elseif ($patterns.Configuration.Count -gt 0) {
+            $result.FailureKind = 'Configuration'
+            $result.RetryDecision = 'Stop'
+            $result.Reason = $patterns.Configuration[0].Reason
+        }
+        elseif ($patterns.Transient.Count -gt 0) {
+            $result.FailureKind = 'Transient'
+            $result.RetryDecision = 'Retry'
+            $result.Reason = $patterns.Transient[0].Reason
+        }
+        elseif ($patterns.Weak.Count -gt 0) {
+            $result.FailureKind = 'Unknown'
+            $result.RetryDecision = 'Retry'
+            $result.Reason = $patterns.Weak[0].Reason
+        }
+        
+        # Set evidence
+        $result.Evidence = $lastError
+        if ($warningLines.Count -gt 0) {
+            $result.Evidence += ' | ' + ($warningLines -join ' | ')
+        }
+        if ($result.Evidence.Length -gt 300) {
+            $result.Evidence = $result.Evidence.Substring(0, 300)
+        }
+        
+        return $result
+    }
+    
+    # Any other exit code: Unknown/Retry
+    return $result
+}
+
 function Find-OutputCandidates {
     param(
         [string]$Directory,
@@ -475,6 +689,7 @@ function Copy-Manifest {
     }
     return ,$copy
 }
+
 function Test-ManifestSchema {
     param($Data)
     if ($null -eq $Data) { return $false }
