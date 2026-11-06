@@ -18,6 +18,8 @@ $script:CurrentLogPath = ""
 $script:StateInitialized = $false
 $script:Config = @{ MaxRetries = 3 } # Changable on demand
 $script:HistoricalMaxAttempts = 1000 # Fixed historical upper bound to preserve legacy data
+$script:ValidFailureKinds = @('None', 'Transient', 'Permanent', 'Configuration', 'Unknown')
+$script:ValidRetryDecisions = @('None', 'Retry', 'Stop')
 $script:RunState = @{
     DownloadsCompleted      = $true
     VerificationsPassed     = $true
@@ -499,6 +501,52 @@ function Get-FailureKind {
     return $result
 }
 
+function Normalize-FailureClassification {
+    param(
+        [string]$Status,
+        $FailureKind,    # Untyped to allow $null
+        $RetryDecision   # Untyped to allow $null
+    )
+    
+    $validKinds = @('None', 'Transient', 'Permanent', 'Configuration', 'Unknown')
+    $validDecisions = @('None', 'Retry', 'Stop')
+    
+    # Check absence (null or missing)
+    $fkAbsent = ($null -eq $FailureKind)
+    $rdAbsent = ($null -eq $RetryDecision)
+    
+    # Check invalid (non-canonical string)
+    $fkInvalid = (-not $fkAbsent) -and ($FailureKind -cnotin $validKinds)
+    $rdInvalid = (-not $rdAbsent) -and ($RetryDecision -cnotin $validDecisions)
+    
+    # 1. Success always clears to None/None
+    if ($Status -eq 'Success') {
+        return @{ FailureKind = 'None'; RetryDecision = 'None'; Reason = 'Success' }
+    }
+    
+    # 2. Any invalid value normalizes the whole pair to Unknown/Retry
+    if ($fkInvalid -or $rdInvalid) {
+        return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry'; Reason = 'Invalid' }
+    }
+    
+    # 3. If either is absent, default the whole pair by Status
+    if ($fkAbsent -or $rdAbsent) {
+        if ($Status -eq 'Failed') {
+            return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry'; Reason = 'Default' }
+        } else {
+            return @{ FailureKind = 'None'; RetryDecision = 'None'; Reason = 'Default' }
+        }
+    }
+    
+    # 4. Failed + None safety rule
+    if ($Status -eq 'Failed' -and $FailureKind -eq 'None') {
+        return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry'; Reason = 'FailedNone' }
+    }
+    
+    # 5. Both present and valid
+    return @{ FailureKind = $FailureKind; RetryDecision = $RetryDecision; Reason = 'Valid' }
+}
+
 function Find-OutputCandidates {
     param(
         [string]$Directory,
@@ -598,20 +646,24 @@ function Get-RetryPlan {
         }
         
         $vid = if ($entry.VideoId) { $entry.VideoId } else { Get-VideoId -Url $entry.Url }
-        if ([string]::IsNullOrWhiteSpace($vid)) {
-            $entry.Status = "Failed"
-            $entry.Error = "Invalid YouTube URL / VideoId"
-            continue
-        }
+                if ([string]::IsNullOrWhiteSpace($vid)) {
+                $entry.Status = "Failed"
+                $entry.Error = "Invalid YouTube URL / VideoId"
+                $entry.FailureKind = 'Permanent'
+                $entry.RetryDecision = 'Stop'
+                continue
+            }
         
-        $previousStatus = [string]$entry.Status
-        $entry.Status = "Pending"
-        $entry.Error = ""
-        $entry.VideoId = $vid
-        
-        if ($previousStatus -ne 'Success' -or -not (Test-FileValidity -FilePath $entry.OutputFilePath -Mode $entry.Mode)) {
-            $entry.OutputFilePath = ""
-        }
+            $previousStatus = [string]$entry.Status
+            $entry.Status = "Pending"
+            $entry.Error = ""
+            $entry.VideoId = $vid
+            # Clear FailureKind/RetryDecision on rescheduling (direct assignment, $entry comes from Copy-Manifest)
+            $entry.FailureKind = 'None'
+            $entry.RetryDecision = 'None'
+            if ($previousStatus -ne 'Success' -or -not (Test-FileValidity -FilePath $entry.OutputFilePath -Mode $entry.Mode)) {
+                $entry.OutputFilePath = ""
+            }
         
         $entry.RetryCount = [Math]::Min((Get-MaxAttempts) - 1, [Math]::Max(0, [int]$entry.AttemptCount - 1))
         $toRun += $entry
@@ -671,23 +723,30 @@ function Copy-Manifest {
             }
         }
 
-        $copy += [PSCustomObject]@{
-            Id             = $item.Id
-            Url            = $item.Url
-            Mode           = $item.Mode
-            MaxHeight      = $item.MaxHeight
-            AudioFormat    = $item.AudioFormat
-            Bitrate        = $item.Bitrate
-            Destination    = $item.Destination
-            Status         = $item.Status
-            Error          = $item.Error
-            VideoId        = $item.VideoId
-            OutputFilePath = $item.OutputFilePath
-            RetryCount     = $retryCount
-            AttemptCount   = $attemptCount
-        }
-    }
-    return ,$copy
+     # Normalize FailureKind and RetryDecision (silent normalization in Copy-Manifest)
+     $rawFK = if ($null -ne $item.PSObject.Properties['FailureKind']) { $item.FailureKind } else { $null }
+     $rawRD = if ($null -ne $item.PSObject.Properties['RetryDecision']) { $item.RetryDecision } else { $null }
+     $normalized = Normalize-FailureClassification -Status $item.Status -FailureKind $rawFK -RetryDecision $rawRD
+     
+     $copy += [PSCustomObject]@{
+         Id             = $item.Id
+         Url            = $item.Url
+         Mode           = $item.Mode
+         MaxHeight      = $item.MaxHeight
+         AudioFormat    = $item.AudioFormat
+         Bitrate        = $item.Bitrate
+         Destination    = $item.Destination
+         Status         = $item.Status
+         Error          = $item.Error
+         VideoId        = $item.VideoId
+         OutputFilePath = $item.OutputFilePath
+         RetryCount     = $retryCount
+         AttemptCount   = $attemptCount
+         FailureKind    = $normalized.FailureKind
+         RetryDecision  = $normalized.RetryDecision
+     }
+ }
+ return ,$copy
 }
 
 function Test-ManifestSchema {
@@ -938,17 +997,38 @@ function Initialize-App {
                     $legacyAttempts = $retryVal
                 }
                 $entry | Add-Member -NotePropertyName AttemptCount -NotePropertyValue $legacyAttempts
-            } else {
-                $parsedAttempts = 0
-                if ([int]::TryParse([string]$entry.AttemptCount, [ref]$parsedAttempts) -and $parsedAttempts -ge 0 -and $parsedAttempts -le $script:HistoricalMaxAttempts) {
-                    $entry.AttemptCount = $parsedAttempts
-                } else {
-                    Write-Log "[WARNING] Invalid AttemptCount ($($entry.AttemptCount)) for $($entry.Id). Treating as exhausted." "Yellow"
-                    $entry.AttemptCount = $script:HistoricalMaxAttempts
-                }
-            }
-        }
-        $script:Manifest = $arr
+                     } else {
+             $parsedAttempts = 0
+             if ([int]::TryParse([string]$entry.AttemptCount, [ref]$parsedAttempts) -and $parsedAttempts -ge 0 -and $parsedAttempts -le $script:HistoricalMaxAttempts) {
+                 $entry.AttemptCount = $parsedAttempts
+             } else {
+                 Write-Log "[WARNING] Invalid AttemptCount ($($entry.AttemptCount)) for $($entry.Id). Treating as exhausted." "Yellow"
+                 $entry.AttemptCount = $script:HistoricalMaxAttempts
+             }
+         }
+         
+         # Normalize FailureKind and RetryDecision (warnings only for Invalid or FailedNone)
+         $rawFK = if ($null -ne $entry.PSObject.Properties['FailureKind']) { $entry.FailureKind } else { $null }
+         $rawRD = if ($null -ne $entry.PSObject.Properties['RetryDecision']) { $entry.RetryDecision } else { $null }
+         $normalized = Normalize-FailureClassification -Status $entry.Status -FailureKind $rawFK -RetryDecision $rawRD
+         
+         if ($normalized.Reason -in @('Invalid', 'FailedNone')) {
+             Write-Log "[WARNING] Item $($entry.Id): FailureKind/RetryDecision normalized to $($normalized.FailureKind)/$($normalized.RetryDecision) (Reason: $($normalized.Reason))" "Yellow"
+         }
+         
+         if ($null -eq $entry.PSObject.Properties['FailureKind']) {
+             $entry | Add-Member -NotePropertyName FailureKind -NotePropertyValue $normalized.FailureKind
+         } else {
+             $entry.FailureKind = $normalized.FailureKind
+         }
+         
+         if ($null -eq $entry.PSObject.Properties['RetryDecision']) {
+             $entry | Add-Member -NotePropertyName RetryDecision -NotePropertyValue $normalized.RetryDecision
+         } else {
+             $entry.RetryDecision = $normalized.RetryDecision
+         }
+     }
+     $script:Manifest = $arr
     } else {
         $script:Manifest = @()
     }
@@ -964,7 +1044,9 @@ function Set-ItemState {
         [AllowNull()][string]$VideoId = $null,
         [AllowNull()][string]$Destination = $null,
         [int]$RetryCount = -1,
-        [int]$AttemptCount = -1
+        [int]$AttemptCount = -1,
+        [string]$FailureKind = $null,
+        [string]$RetryDecision = $null
     )
     if ($null -eq $Item -or [string]::IsNullOrWhiteSpace([string]$Item.Id)) {return $false }
     
@@ -999,15 +1081,17 @@ function Set-ItemState {
     if ($PSBoundParameters.ContainsKey('VideoId')) { $target.VideoId = $VideoId }
     if ($PSBoundParameters.ContainsKey('Destination')) { $target.Destination = $Destination }
     
-    if ($PSBoundParameters.ContainsKey('RetryCount')) {
-        if ($RetryCount -lt 0 -or $RetryCount -gt $script:HistoricalMaxAttempts) { return $false }
-        $target.RetryCount = $RetryCount
+     if ($PSBoundParameters.ContainsKey('RetryCount')) {
+     if ($RetryCount -lt 0 -or $RetryCount -gt $script:HistoricalMaxAttempts) { return $false }
+     $target.RetryCount = $RetryCount
     }
     if ($PSBoundParameters.ContainsKey('AttemptCount')) {
         if ($AttemptCount -lt 0 -or $AttemptCount -gt $script:HistoricalMaxAttempts) { return $false }
         $target.AttemptCount = $AttemptCount
     }
-    
+    # Reject non-canonical FailureKind/RetryDecision before any mutation or save
+    if ($PSBoundParameters.ContainsKey('FailureKind') -and $FailureKind -cnotin $script:ValidFailureKinds) { return $false }
+    if ($PSBoundParameters.ContainsKey('RetryDecision') -and $RetryDecision -cnotin $script:ValidRetryDecisions) { return $false }
     # Keep the retry counter consistent with attempts actually started.
     # Note: Enforcing the operational budget (MaxRetries) is the responsibility of Invoke-ItemDownload 
     # and Get-MaxAttempts. Set-ItemState only preserves history up to HistoricalMaxAttempts.
@@ -1016,13 +1100,38 @@ function Set-ItemState {
     } else {
         $target.RetryCount = 0
     }
+    # Determine FailureKind and RetryDecision based on Status and passed parameters
+    $fkPassed = $PSBoundParameters.ContainsKey('FailureKind')
+    $rdPassed = $PSBoundParameters.ContainsKey('RetryDecision')
     
+    if ($Status -eq 'Success') {
+        $target.FailureKind = 'None'; $target.RetryDecision = 'None'
+    }
+    elseif (-not $fkPassed -and -not $rdPassed) {
+        if ($Status -eq 'Failed') {
+            Write-Log "[WARNING] Failed without FailureKind/RetryDecision. Using Unknown/Retry" "Yellow"
+            $target.FailureKind = 'Unknown'; $target.RetryDecision = 'Retry'
+        } else {
+            $target.FailureKind = 'None'; $target.RetryDecision = 'None'
+        }
+    }
+    else {
+        if ($fkPassed -xor $rdPassed) {
+            Write-Log "[WARNING] Only one of FailureKind/RetryDecision passed. Filling the other with a safe default" "Yellow"
+        }
+        $target.FailureKind   = if ($fkPassed) { $FailureKind }   else { 'Unknown' }
+        $target.RetryDecision = if ($rdPassed) { $RetryDecision } else { 'Retry' }
+        if ($Status -eq 'Failed' -and $target.FailureKind -eq 'None') {
+            Write-Log "[WARNING] Failed + FailureKind=None. Normalizing to Unknown/Retry" "Yellow"
+            $target.FailureKind = 'Unknown'; $target.RetryDecision = 'Retry'
+        }
+    }
     if (-not (Save-AtomicJson -Path $script:ManifestPath -Data $tempManifest)) {
         $script:RunState.ManifestSaved = $false
         return $false
     }
     
-    # Mutate the existing object in place so references held by callers remain valid.
+     # Mutate the existing object in place so references held by callers remain valid.
     $current.Status = $target.Status
     $current.Error = $target.Error
     $current.OutputFilePath = $target.OutputFilePath
@@ -1030,7 +1139,17 @@ function Set-ItemState {
     $current.Destination = $target.Destination
     $current.RetryCount = $target.RetryCount
     $current.AttemptCount = $target.AttemptCount
-    
+    # Safely update FailureKind and RetryDecision (Add-Member needed for legacy items without these properties)
+    if ($null -eq $current.PSObject.Properties['FailureKind']) {
+        $current | Add-Member -NotePropertyName FailureKind -NotePropertyValue $target.FailureKind -Force
+    } else {
+        $current.FailureKind = $target.FailureKind
+    }
+    if ($null -eq $current.PSObject.Properties['RetryDecision']) {
+        $current | Add-Member -NotePropertyName RetryDecision -NotePropertyValue $target.RetryDecision -Force
+    } else {
+        $current.RetryDecision = $target.RetryDecision
+    }
     $Item.Status = $target.Status
     $Item.Error = $target.Error
     $Item.OutputFilePath = $target.OutputFilePath
@@ -1038,7 +1157,16 @@ function Set-ItemState {
     $Item.Destination = $target.Destination
     $Item.RetryCount = $target.RetryCount
     $Item.AttemptCount = $target.AttemptCount
-    
+    if ($null -eq $Item.PSObject.Properties['FailureKind']) {
+        $Item | Add-Member -NotePropertyName FailureKind -NotePropertyValue $target.FailureKind -Force
+    } else {
+        $Item.FailureKind = $target.FailureKind
+    }
+    if ($null -eq $Item.PSObject.Properties['RetryDecision']) {
+        $Item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue $target.RetryDecision -Force
+    } else {
+        $Item.RetryDecision = $target.RetryDecision
+    }
     return $true
 }
 
@@ -1738,13 +1866,15 @@ function Start-DownloadRun {
             $finalManifest = Copy-Manifest $script:Manifest
             $needsSave = $false
             # هذا الجزء كان مفقوداً وهو المسؤول عن حساب قيمة $needsSave
-            foreach ($item in $finalManifest) {
-                if ($item.Status -eq 'Downloading') { 
-                    $item.Status = 'Failed'
-                    $item.Error = 'Interrupted'
-                    $needsSave = $true 
-                }
-            }
+             foreach ($item in $finalManifest) {
+             if ($item.Status -eq 'Downloading') { 
+                 $item.Status = 'Failed'
+                 $item.Error = 'Interrupted'
+                 $item.FailureKind = 'Unknown'
+                 $item.RetryDecision = 'Retry'
+                 $needsSave = $true 
+             }
+         }
             if ($needsSave) {
                 $script:RunState.ManifestSaved = $false # تعيين افتراضي للفشل للأمان
                 try {
@@ -1824,7 +1954,7 @@ function Main {
                 foreach ($u in $urls) {
                     $newItems += [PSCustomObject]@{ 
                         Id=[guid]::NewGuid().ToString(); Url=$u; VideoId=""; Mode="Video"; MaxHeight=$quality; 
-                        AudioFormat=""; Bitrate=0; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 
+                        AudioFormat=""; Bitrate=0; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 ; FailureKind='None'; RetryDecision='None'
                     }
                 }
                 $tempManifest = Copy-Manifest $script:Manifest
@@ -1844,7 +1974,7 @@ function Main {
                 $quality = Select-VideoQuality
                 $newItem = [PSCustomObject]@{ 
                     Id=[guid]::NewGuid().ToString(); Url=$url; VideoId=""; Mode="Video"; MaxHeight=$quality; 
-                    AudioFormat=""; Bitrate=0; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 
+                    AudioFormat=""; Bitrate=0; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 ; FailureKind='None'; RetryDecision='None'
                 }
                 $tempManifest = Copy-Manifest $script:Manifest
                 $tempManifest += $newItem
@@ -1863,7 +1993,7 @@ function Main {
                 $br = 128; if ($fmt -eq "MP3") { $br = Select-Mp3Bitrate }
                 $newItem = [PSCustomObject]@{ 
                     Id=[guid]::NewGuid().ToString(); Url=$url; VideoId=""; Mode="Audio"; MaxHeight=0; AudioFormat=$fmt; 
-                    Bitrate=$br; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 
+                    Bitrate=$br; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 ; FailureKind='None'; RetryDecision='None'
                 }
                 $tempManifest = Copy-Manifest $script:Manifest
                 $tempManifest += $newItem
@@ -1885,12 +2015,12 @@ function Main {
                         $fmt = Select-AudioFormat; $br = 128; if ($fmt -eq "MP3") { $br = Select-Mp3Bitrate }
                         $newItems += [PSCustomObject]@{ 
                             Id=[guid]::NewGuid().ToString(); Url=$u; VideoId=""; Mode="Audio"; MaxHeight=0; AudioFormat=$fmt; 
-                            Bitrate=$br; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 
+                            Bitrate=$br; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 ; FailureKind='None'; RetryDecision='None'
                         }
                     } else {
                         $newItems += [PSCustomObject]@{ 
                             Id=[guid]::NewGuid().ToString(); Url=$u; VideoId=""; Mode="Video"; MaxHeight=(Select-VideoQuality); 
-                            AudioFormat=""; Bitrate=0; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 
+                            AudioFormat=""; Bitrate=0; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 ; FailureKind='None'; RetryDecision='None'
                         }
                     }
                 }
@@ -1912,7 +2042,7 @@ function Main {
                 foreach ($u in $urls) {
                     $newItems += [PSCustomObject]@{ 
                         Id=[guid]::NewGuid().ToString(); Url=$u; VideoId=""; Mode="Audio"; MaxHeight=0; AudioFormat=$fmt; 
-                        Bitrate=$br; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 
+                        Bitrate=$br; Destination=""; Status="Pending"; Error=""; OutputFilePath=""; RetryCount=0; AttemptCount=0 ; FailureKind='None'; RetryDecision='None'
                     }
                 }
                 $tempManifest = Copy-Manifest $script:Manifest
@@ -1980,12 +2110,14 @@ if ($script:RunAsMain) {
         if ($script:StateInitialized -and $script:RunState.ManifestSaved) {
             $finalManifest = Copy-Manifest $script:Manifest
             $needsSave = $false
-            foreach ($item in $finalManifest) {
-                if ($item.Status -eq 'Downloading') {
-                    $item.Status = 'Failed'; $item.Error = 'Global interrupt'
-                    $needsSave = $true
-                }
+        foreach ($item in $finalManifest) {
+            if ($item.Status -eq 'Downloading') {
+            $item.Status = 'Failed'; $item.Error = 'Global interrupt'
+            $item.FailureKind = 'Unknown'
+            $item.RetryDecision = 'Retry'
+            $needsSave = $true
             }
+        }
             if ($needsSave) {
                 try {
                     if (Save-AtomicJson -Path $script:ManifestPath -Data $finalManifest) {

@@ -642,8 +642,9 @@ Describe "Phase 3 - Delivery 1: Pure Helper Functions" {
             Test-Path -LiteralPath $script:ValidVideoPath | Should -BeTrue
         }
     }
+}
 
-    Describe "Phase 3 - Delivery 2: Find-OutputCandidates" {
+Describe "Phase 3 - Delivery 2: Find-OutputCandidates" {
     BeforeAll {
         function global:ffprobe { }
     }
@@ -1680,4 +1681,784 @@ Describe "Phase 4 - Delivery 1: Get-FailureKind" {
     }
 }
 
+Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        
+        # Safety guard: ensure ManifestPath is under TestDrive
+        $normalizedTestDrive = [System.IO.Path]::GetFullPath($TestDrive).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        $normalizedManifestPath = [System.IO.Path]::GetFullPath($script:ManifestPath)
+        if (-not $normalizedManifestPath.StartsWith($normalizedTestDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Safety check failed: ManifestPath '$script:ManifestPath' is not under TestDrive '$TestDrive'. Aborting to prevent data loss."
+        }
+
+        function script:ConvertFrom-JsonArray {
+            param([string]$Json)
+            $items = @(ConvertFrom-Json -InputObject $Json | ForEach-Object { $_ })
+            return ,$items
+        }
+        
+        function global:yt-dlp { }
+        function global:ffprobe { }
+        
+        Mock Start-Sleep { }
+        Mock Test-FileValidity { return $true }
+        Mock Get-FileVerdict { return @{ Verdict = 'Valid'; Reason = 'OK' } }
+        
+        function script:New-LegacyItem {
+            param([string]$Status = 'Pending', [string]$Id = ([guid]::NewGuid().ToString()))
+            [PSCustomObject]@{
+                Id = $Id
+                Url = 'https://youtube.com/watch?v=AbC12345678'
+                Mode = 'Video'
+                MaxHeight = 720
+                AudioFormat = ''
+                Bitrate = 0
+                Destination = $TestDrive
+                Status = $Status
+                Error = ''
+                OutputFilePath = ''
+                VideoId = 'AbC12345678'
+                RetryCount = 0
+                AttemptCount = 0
+            }
+        }
+    }
+
+    AfterAll {
+        Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
+        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        $env:APPDATA = $script:OrigAppData
+    }
+
+    BeforeEach {
+        $script:Config.MaxRetries = 3
+        $script:RunState.ManifestSaved = $true
+        if (Test-Path $script:ManifestPath) { Remove-Item $script:ManifestPath -Force }
+        
+        $script:ValidVideoPath = Join-Path $TestDrive 'valid_video.mp4'
+        Set-Content -Path $script:ValidVideoPath -Value 'dummy video content' -Force
+    }
+
+    Context 'Normalize-FailureClassification' {
+        It 'Returns Reason=Valid when both fields are canonical' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind 'Transient' -RetryDecision 'Retry'
+            $r.FailureKind | Should -Be 'Transient'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'Valid'
+        }
+        It 'Returns Reason=Default when both absent, Status=Failed' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind $null -RetryDecision $null
+            $r.FailureKind | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'Default'
+        }
+        It 'Returns Reason=Default when both absent, Status=Pending' {
+            $r = Normalize-FailureClassification -Status 'Pending' -FailureKind $null -RetryDecision $null
+            $r.FailureKind | Should -Be 'None'
+            $r.RetryDecision | Should -Be 'None'
+            $r.Reason | Should -Be 'Default'
+        }
+        It 'Returns Reason=Invalid for non-canonical FailureKind' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind 'permanent' -RetryDecision 'Retry'
+            $r.FailureKind | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'Invalid'
+        }
+        It 'Returns Reason=Invalid for non-canonical RetryDecision' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind 'Transient' -RetryDecision 'retry'
+            $r.FailureKind | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'Invalid'
+        }
+        It 'Returns Reason=Invalid for empty string FailureKind' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind '' -RetryDecision 'Retry'
+            $r.FailureKind | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'Invalid'
+        }
+        It 'Returns Reason=FailedNone for Failed + FailureKind=None' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind 'None' -RetryDecision 'Retry'
+            $r.FailureKind | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'FailedNone'
+        }
+        It 'Returns Reason=Success for Success status (ignores passed values)' {
+            $r = Normalize-FailureClassification -Status 'Success' -FailureKind 'Transient' -RetryDecision 'Retry'
+            $r.FailureKind | Should -Be 'None'
+            $r.RetryDecision | Should -Be 'None'
+            $r.Reason | Should -Be 'Success'
+        }
+        It 'Returns Reason=Default when only FailureKind absent' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind $null -RetryDecision 'Retry'
+            $r.FailureKind | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason | Should -Be 'Default'
+        }
+        It 'Returns Reason=Default when only RetryDecision absent' {
+            $r = Normalize-FailureClassification -Status 'Pending' -FailureKind 'Transient' -RetryDecision $null
+            $r.FailureKind | Should -Be 'None'
+            $r.RetryDecision | Should -Be 'None'
+            $r.Reason | Should -Be 'Default'
+        }
+    }
+
+    Context 'Copy-Manifest' {
+        It 'Adds FailureKind/RetryDecision to legacy items without them' {
+            $item = New-LegacyItem -Status 'Pending'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'None'
+            $res[0].RetryDecision | Should -Be 'None'
+        }
+        It 'Normalizes Failed legacy item to Unknown/Retry' {
+            $item = New-LegacyItem -Status 'Failed'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'Unknown'
+            $res[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Normalizes invalid FailureKind to Unknown/Retry' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'permanent'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'Unknown'
+            $res[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Preserves valid FailureKind/RetryDecision' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'Transient'
+            $res[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Normalizes Success with stale values to None/None' {
+            $item = New-LegacyItem -Status 'Success'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'None'
+            $res[0].RetryDecision | Should -Be 'None'
+        }
+        It 'Normalizes Failed + FailureKind=None to Unknown/Retry' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'None'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'None'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'Unknown'
+            $res[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Corrupt fields: other item properties remain intact' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'garbage'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'invalid'
+            $res = Copy-Manifest -Source @($item)
+            $res[0].FailureKind | Should -Be 'Unknown'
+            $res[0].RetryDecision | Should -Be 'Retry'
+            $res[0].Url | Should -Be 'https://youtube.com/watch?v=AbC12345678'
+            $res[0].Mode | Should -Be 'Video'
+            $res[0].Status | Should -Be 'Failed'
+        }
+        It 'JSON null values are treated as absent (Pending case)' {
+            $json = '[{"Id":"00000000-0000-0000-0000-000000000001","Url":"https://youtube.com/watch?v=AbC12345678","Mode":"Video","MaxHeight":720,"AudioFormat":"","Bitrate":0,"Destination":"C:\\temp","Status":"Pending","Error":"","OutputFilePath":"","VideoId":"AbC12345678","RetryCount":0,"AttemptCount":0,"FailureKind":null,"RetryDecision":null}]'
+            $parsed = ConvertFrom-JsonArray $json
+            $res = Copy-Manifest -Source $parsed
+            $res[0].FailureKind | Should -Be 'None'
+            $res[0].RetryDecision | Should -Be 'None'
+        }
+        It 'JSON null values are treated as absent (Failed case)' {
+            $json = '[{"Id":"00000000-0000-0000-0000-000000000001","Url":"https://youtube.com/watch?v=AbC12345678","Mode":"Video","MaxHeight":720,"AudioFormat":"","Bitrate":0,"Destination":"C:\\temp","Status":"Failed","Error":"","OutputFilePath":"","VideoId":"AbC12345678","RetryCount":0,"AttemptCount":0,"FailureKind":null,"RetryDecision":null}]'
+            $parsed = ConvertFrom-JsonArray $json
+            $res = Copy-Manifest -Source $parsed
+            $res[0].FailureKind | Should -Be 'Unknown'
+            $res[0].RetryDecision | Should -Be 'Retry'
+        }
+    }
+
+    Context 'Initialize-App' {
+        It 'Loads legacy manifest without FailureKind/RetryDecision and normalizes' {
+            $item = New-LegacyItem -Status 'Failed'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'Unknown'
+            $script:Manifest[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Preserves valid FailureKind/RetryDecision on load' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'Transient'
+            $script:Manifest[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Round-trip: save and reload preserves values' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Permanent'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Stop'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'Permanent'
+            $script:Manifest[0].RetryDecision | Should -Be 'Stop'
+        }
+        It 'Manifest with corrupt FailureKind passes Test-ManifestSchema' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'garbage'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            Test-ManifestSchema -Data @($item) | Should -BeTrue
+        }
+        It 'Pending with Transient/Retry survives load, copy, save' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'Transient'
+            $script:Manifest[0].RetryDecision | Should -Be 'Retry'
+            $copied = Copy-Manifest -Source $script:Manifest
+            $copied[0].FailureKind | Should -Be 'Transient'
+            $copied[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'JSON null values are treated as absent' {
+            $testDest = Join-Path $TestDrive 'test_dest'
+            New-Item -ItemType Directory -Path $testDest -Force | Out-Null
+            
+            $item = [ordered]@{
+                Id = '00000000-0000-0000-0000-000000000001'
+                Url = 'https://youtube.com/watch?v=AbC12345678'
+                Mode = 'Video'
+                MaxHeight = 720
+                AudioFormat = ''
+                Bitrate = 0
+                Destination = $testDest
+                Status = 'Failed'
+                Error = ''
+                OutputFilePath = ''
+                VideoId = 'AbC12345678'
+                RetryCount = 0
+                AttemptCount = 0
+                FailureKind = $null
+                RetryDecision = $null
+            }
+            
+            $json = ConvertTo-Json -InputObject @($item) -Depth 10
+            $json.TrimStart() | Should -Match '^\['
+            [System.IO.File]::WriteAllText($script:ManifestPath, $json, [System.Text.Encoding]::UTF8)
+            
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'Unknown'
+            $script:Manifest[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Corrupt fields: other properties remain intact after Initialize-App' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'garbage'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'invalid'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'Unknown'
+            $script:Manifest[0].RetryDecision | Should -Be 'Retry'
+            $script:Manifest[0].Url | Should -Be 'https://youtube.com/watch?v=AbC12345678'
+            $script:Manifest[0].Mode | Should -Be 'Video'
+        }
+        It 'Initialize-App warns on Invalid reason' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'garbage'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'invalid'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter { 
+                $Message -like '*(Reason: Invalid)*' 
+            }
+        }
+        It 'Initialize-App warns on FailedNone reason' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'None'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'None'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter { 
+                $Message -like '*(Reason: FailedNone)*' 
+            }
+        }
+        It 'Initialize-App is silent on Default reason (Pending)' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            Should -Invoke -CommandName Write-Log -Times 0 -Exactly -ParameterFilter { 
+                $Message -like '*(Reason:*' 
+            }
+        }
+        It 'Initialize-App is silent on Success reason' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Success'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            Should -Invoke -CommandName Write-Log -Times 0 -Exactly -ParameterFilter { 
+                $Message -like '*(Reason:*' 
+            }
+        }
+        It 'Initialize-App with Success plus stale/invalid values normalizes to None/None' {
+            $item = New-LegacyItem -Status 'Success'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'garbage'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'invalid'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Initialize-App
+            $script:Manifest[0].FailureKind | Should -Be 'None'
+            $script:Manifest[0].RetryDecision | Should -Be 'None'
+        }
+    }
+
+    Context 'Set-ItemState with FailureKind/RetryDecision' {
+        It 'Success clears to None/None regardless of passed values' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            Mock Test-FileValidity { return $true }
+            $item.OutputFilePath = $script:ValidVideoPath
+            $result = Set-ItemState -Item $item -Status 'Success' -OutputFilePath $item.OutputFilePath -FailureKind 'Transient' -RetryDecision 'Retry'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+        It 'Pending without passed fields gives None/None (no warning)' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Pending'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+            Should -Invoke -CommandName Write-Log -Times 0 -Exactly -ParameterFilter {
+                $Message -like '*WARNING*FailureKind*'
+            }
+        }
+        It 'Downloading without passed fields gives None/None' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Downloading'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+        It 'Downloading with valid passed values stores them' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Downloading' -FailureKind 'Transient' -RetryDecision 'Retry'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Failed without passed fields gives Unknown/Retry and logs warning' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Failed'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Unknown'
+            $item.RetryDecision | Should -Be 'Retry'
+            Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter {
+                $Message -like '*WARNING*Failed without FailureKind*'
+            }
+        }
+        It 'Failed with valid passed values stores them' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Failed' -FailureKind 'Permanent' -RetryDecision 'Stop'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Permanent'
+            $item.RetryDecision | Should -Be 'Stop'
+        }
+        It 'Pending with valid passed values stores them' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Pending' -FailureKind 'Transient' -RetryDecision 'Retry'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Only FailureKind passed: keeps it, fills RetryDecision=Retry, logs warning' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Pending' -FailureKind 'Permanent'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Permanent'
+            $item.RetryDecision | Should -Be 'Retry'
+            Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter {
+                $Message -like '*WARNING*Only one of FailureKind*'
+            }
+        }
+        It 'Only RetryDecision passed: fills FailureKind=Unknown, keeps it, logs warning' {
+            Mock Write-Log { }
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Pending' -RetryDecision 'Stop'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Unknown'
+            $item.RetryDecision | Should -Be 'Stop'
+            Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter {
+                $Message -like '*WARNING*Only one of FailureKind*'
+            }
+        }
+        It 'Rejects non-canonical FailureKind (return $false, no save, no memory change, Status unchanged)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $before = Get-Content -Path $script:ManifestPath -Raw
+            $result = Set-ItemState -Item $item -Status 'Failed' -FailureKind 'permanent' -RetryDecision 'Retry'
+            $result | Should -BeFalse
+            $after = Get-Content -Path $script:ManifestPath -Raw
+            $after | Should -Be $before
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+            $item.Status | Should -Be 'Pending'
+        }
+        It 'Rejects non-canonical RetryDecision (return $false, no save, no memory change, Status unchanged)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $before = Get-Content -Path $script:ManifestPath -Raw
+            $result = Set-ItemState -Item $item -Status 'Failed' -FailureKind 'Transient' -RetryDecision 'retry'
+            $result | Should -BeFalse
+            $after = Get-Content -Path $script:ManifestPath -Raw
+            $after | Should -Be $before
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+            $item.Status | Should -Be 'Pending'
+        }
+        It 'Rejects non-canonical FailureKind alone (Status=Pending, no save, no memory change)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $before = Get-Content -Path $script:ManifestPath -Raw
+            $result = Set-ItemState -Item $item -Status 'Pending' -FailureKind 'permanent'
+            $result | Should -BeFalse
+            $after = Get-Content -Path $script:ManifestPath -Raw
+            $after | Should -Be $before
+            $item.Status | Should -Be 'Pending'
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Rejects non-canonical RetryDecision alone (Status=Pending, no save, no memory change)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $before = Get-Content -Path $script:ManifestPath -Raw
+            $result = Set-ItemState -Item $item -Status 'Pending' -RetryDecision 'retry'
+            $result | Should -BeFalse
+            $after = Get-Content -Path $script:ManifestPath -Raw
+            $after | Should -Be $before
+            $item.Status | Should -Be 'Pending'
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Rejects non-canonical FailureKind alone (Status=Failed, no save, no memory change)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $before = Get-Content -Path $script:ManifestPath -Raw
+            $result = Set-ItemState -Item $item -Status 'Failed' -FailureKind 'permanent'
+            $result | Should -BeFalse
+            $after = Get-Content -Path $script:ManifestPath -Raw
+            $after | Should -Be $before
+            $item.Status | Should -Be 'Pending'
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Rejects non-canonical RetryDecision alone (Status=Failed, no save, no memory change)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $before = Get-Content -Path $script:ManifestPath -Raw
+            $result = Set-ItemState -Item $item -Status 'Failed' -RetryDecision 'retry'
+            $result | Should -BeFalse
+            $after = Get-Content -Path $script:ManifestPath -Raw
+            $after | Should -Be $before
+            $item.Status | Should -Be 'Pending'
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Adds FailureKind/RetryDecision to legacy item without them' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $item.PSObject.Properties.Name | Should -Not -Contain 'FailureKind'
+            $result = Set-ItemState -Item $item -Status 'Pending'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+        It 'Failed + FailureKind=None passed normalizes to Unknown/Retry' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'Failed' -FailureKind 'None' -RetryDecision 'None'
+            $result | Should -BeTrue
+            $item.FailureKind | Should -Be 'Unknown'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+        It 'Unrecognized Status: Set-ItemState returns $false (schema rejects it)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $result = Set-ItemState -Item $item -Status 'WeirdStatus'
+            $result | Should -BeFalse
+            $item.FailureKind | Should -Be 'Transient'
+            $item.RetryDecision | Should -Be 'Retry'
+            $item.Status | Should -Be 'Pending'
+        }
+    }
+
+    Context 'Get-RetryPlan clears fields' {
+        It 'Clears FailureKind/RetryDecision on rescheduling' {
+            $item = New-LegacyItem -Status 'Failed'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $item.AttemptCount = 1
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            $plan = Get-RetryPlan -Manifest $script:Manifest
+            $plan.ItemsToRun.Count | Should -Be 1
+            $plan.ItemsToRun[0].FailureKind | Should -Be 'None'
+            $plan.ItemsToRun[0].RetryDecision | Should -Be 'None'
+        }
+        It 'Invalid VideoId marks item Failed with Permanent/Stop while keeping valid item' {
+            $bad = [guid]::NewGuid().ToString()
+            $good = [guid]::NewGuid().ToString()
+            $manifest = @(
+                [PSCustomObject]@{ Id=$bad; Url='https://example.com/video'; Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0; Destination=$TestDrive; Status='Failed'; Error=''; OutputFilePath=''; VideoId=''; RetryCount=0; AttemptCount=1; FailureKind='Transient'; RetryDecision='Retry' },
+                [PSCustomObject]@{ Id=$good; Url='https://youtube.com/watch?v=AbC12345678'; Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0; Destination=$TestDrive; Status='Failed'; Error=''; OutputFilePath=''; VideoId='AbC12345678'; RetryCount=0; AttemptCount=1; FailureKind='Transient'; RetryDecision='Retry' }
+            )
+            $plan = Get-RetryPlan -Manifest $manifest
+            $plan.ItemsToRun.Count | Should -Be 1
+            $plan.ItemsToRun[0].Id | Should -Be $good
+            $badEntry = @($plan.ModifiedManifest) | Where-Object { $_.Id -eq $bad }
+            $badEntry.Status | Should -Be 'Failed'
+            $badEntry.Error | Should -Be 'Invalid YouTube URL / VideoId'
+            $badEntry.FailureKind | Should -Be 'Permanent'
+            $badEntry.RetryDecision | Should -Be 'Stop'
+        }
+    }
+
+    Context 'Interrupt handlers' {
+        It 'Start-DownloadRun handler sets Unknown/Retry on Downloading items (assert on saved file)' {
+            $item = New-LegacyItem -Status 'Pending'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'None'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'None'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            
+            # Ensure StateInitialized is true so the finally block runs
+            $script:StateInitialized = $true
+            $script:StateInitialized | Should -BeTrue
+            
+            # Mocks to prevent side effects
+            Mock Save-Settings { return $true }
+            Mock Test-HibernateEligibility { return $false }
+            Mock Invoke-Hibernation { }
+            
+            $script:reachedDownloading = $false
+            $script:capturedItemId = $null
+            Mock Invoke-ItemDownload {
+                param([PSCustomObject]$Item)
+                $script:capturedItemId = $Item.Id
+                Set-ItemState -Item $Item -Status 'Downloading'
+                $script:reachedDownloading = $true
+                throw 'Simulated interruption'
+            }
+            Mock Read-Host { return '' }
+            
+            Start-DownloadRun -Items @($item) -IsResume $true
+            
+            Should -Invoke -CommandName Invoke-ItemDownload -Times 1 -Exactly
+            $script:capturedItemId | Should -Be $item.Id
+            $script:reachedDownloading | Should -BeTrue
+            
+            $saved = ConvertFrom-JsonArray (Get-Content -Path $script:ManifestPath -Raw)
+            $saved[0].Status | Should -Be 'Failed'
+            $saved[0].Error | Should -Be 'Interrupted'
+            $saved[0].FailureKind | Should -Be 'Unknown'
+            $saved[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Global interrupt handler sets Unknown/Retry (static check)' {
+            $scriptPath = Join-Path $PSScriptRoot '..\Development\YT-Downloader.ps1'
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $pattern = "\`$item\.Error = 'Global interrupt'[\s\r\n]+\`$item\.FailureKind = 'Unknown'[\s\r\n]+\`$item\.RetryDecision = 'Retry'"
+            $content | Should -Match $pattern
+        }
+    }
+
+    Context 'Startup Success to Pending' {
+        It 'Success to Pending clears FailureKind/RetryDecision via Start-DownloadRun' {
+            $item = New-LegacyItem -Status 'Success'
+            $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
+            $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
+            $item.OutputFilePath = 'C:\nonexistent.mp4'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            
+            $script:StateInitialized = $true
+            
+            # Mocks to prevent side effects
+            Mock Save-Settings { return $true }
+            Mock Test-HibernateEligibility { return $false }
+            Mock Invoke-Hibernation { }
+            
+            Mock Test-FileValidity {
+                param([string]$FilePath, [string]$Mode)
+                return $false
+            }
+            
+            $script:capturedStatus = $null
+            $script:capturedFailureKind = $null
+            $script:capturedRetryDecision = $null
+            Mock Invoke-ItemDownload {
+                param([PSCustomObject]$Item)
+                $script:capturedStatus = $Item.Status
+                $script:capturedFailureKind = $Item.FailureKind
+                $script:capturedRetryDecision = $Item.RetryDecision
+                return $true
+            }
+            Mock Read-Host { return '' }
+            
+            Start-DownloadRun -Items @($item) -IsResume $true
+            
+            Should -Invoke -CommandName Test-FileValidity -Times 1 -Exactly -ParameterFilter { 
+                $FilePath -eq 'C:\nonexistent.mp4' 
+            }
+            Should -Invoke -CommandName Invoke-ItemDownload -Times 1 -Exactly
+            
+            $script:capturedStatus | Should -Be 'Pending'
+            $script:capturedFailureKind | Should -Be 'None'
+            $script:capturedRetryDecision | Should -Be 'None'
+            
+            $saved = ConvertFrom-JsonArray (Get-Content -Path $script:ManifestPath -Raw)
+            $saved[0].Status | Should -Be 'Pending'
+            $saved[0].FailureKind | Should -Be 'None'
+            $saved[0].RetryDecision | Should -Be 'None'
+        }
+    }
+
+    Context 'Construction sites' {
+        It 'All six new-item construction sites include FailureKind/RetryDecision' {
+            $scriptPath = Join-Path $PSScriptRoot '..\Development\YT-Downloader.ps1'
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $regexMatches = [regex]::Matches($content, "FailureKind='None';\s*RetryDecision='None'")
+            $regexMatches.Count | Should -Be 6
+        }
+        It 'No construction site ends with AttemptCount=0 without the new fields' {
+            $scriptPath = Join-Path $PSScriptRoot '..\Development\YT-Downloader.ps1'
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $badPattern = 'AttemptCount=0\s*\}'
+            $badMatches = [regex]::Matches($content, $badPattern)
+            $badMatches.Count | Should -Be 0
+        }
+    }
+
+    Context 'Saved JSON' {
+        It 'Saved JSON contains both FailureKind and RetryDecision properties after Set-ItemState' {
+            $item = New-LegacyItem -Status 'Pending'
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            
+            Set-ItemState -Item $item -Status 'Failed' -FailureKind 'Transient' -RetryDecision 'Retry'
+            
+            $raw = Get-Content -Path $script:ManifestPath -Raw
+            $raw | Should -Match '"FailureKind"'
+            $raw | Should -Match '"RetryDecision"'
+            
+            $parsed = ConvertFrom-JsonArray $raw
+            $parsed[0].FailureKind | Should -Be 'Transient'
+            $parsed[0].RetryDecision | Should -Be 'Retry'
+        }
+        It 'Legacy manifest saved without data loss after Initialize-App (all 13 properties preserved)' {
+            $item = New-LegacyItem -Status 'Failed'
+            $originalValues = @{
+                Id = $item.Id
+                Url = $item.Url
+                Mode = $item.Mode
+                MaxHeight = $item.MaxHeight
+                AudioFormat = $item.AudioFormat
+                Bitrate = $item.Bitrate
+                Destination = $item.Destination
+                Status = $item.Status
+                Error = $item.Error
+                OutputFilePath = $item.OutputFilePath
+                VideoId = $item.VideoId
+                RetryCount = $item.RetryCount
+                AttemptCount = $item.AttemptCount
+            }
+            
+            $script:Manifest = @($item)
+            Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
+            
+            Initialize-App
+            
+            Set-ItemState -Item $script:Manifest[0] -Status 'Failed' -Error 'Test error'
+            
+            $raw = Get-Content -Path $script:ManifestPath -Raw
+            $parsed = ConvertFrom-JsonArray $raw
+            $parsed.Count | Should -Be 1
+            
+            $parsed[0].Status | Should -Be 'Failed'
+            $parsed[0].Error | Should -Be 'Test error'
+            
+            $propertiesToCompare = @('Id', 'Url', 'Mode', 'MaxHeight', 'AudioFormat', 'Bitrate', 
+                                     'Destination', 'OutputFilePath', 'VideoId', 'RetryCount', 'AttemptCount')
+            foreach ($prop in $propertiesToCompare) {
+                $parsed[0].$prop | Should -Be $originalValues[$prop]
+            }
+            
+            $parsed[0].PSObject.Properties.Name | Should -Contain 'FailureKind'
+            $parsed[0].PSObject.Properties.Name | Should -Contain 'RetryDecision'
+            $parsed[0].FailureKind | Should -Be 'Unknown'
+            $parsed[0].RetryDecision | Should -Be 'Retry'
+        }
+    }
 }
