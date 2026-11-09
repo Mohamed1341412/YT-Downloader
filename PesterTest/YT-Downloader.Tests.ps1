@@ -59,7 +59,7 @@ $global:LASTEXITCODE = 0
 AfterAll {
     $env:APPDATA = $script:OrigAppData
     $env:PATH = $script:OrigPath
-    Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
+    Remove-Item function:\yt-dlp -ErrorAction SilentlyContinue
 }
 
 Describe "Phase 1: Configuration and Schema Validation" {
@@ -430,7 +430,7 @@ Describe "Phase 3 - Delivery 1: Pure Helper Functions" {
     }
 
     AfterAll {
-        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
     }
 
     BeforeEach {
@@ -650,7 +650,7 @@ Describe "Phase 3 - Delivery 2: Find-OutputCandidates" {
     }
 
     AfterAll {
-        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
     }
 
     BeforeEach {
@@ -782,8 +782,8 @@ Describe "Phase 3 - Delivery 3: Invoke-ItemDownload Corrupt/Unknown/OtherMode Ha
     }
 
     AfterAll {
-        Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
-        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        Remove-Item function:\yt-dlp -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
         $env:APPDATA = $script:OrigAppData
     }
 
@@ -1064,8 +1064,8 @@ Describe "Phase 3 - Delivery 4: Archive Branch (Case C) and Unified Cleanup Fail
     }
 
     AfterAll {
-        Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
-        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        Remove-Item function:\yt-dlp -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
         $env:APPDATA = $script:OrigAppData
     }
 
@@ -1733,8 +1733,8 @@ Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
     }
 
     AfterAll {
-        Remove-Item function:global:yt-dlp -ErrorAction SilentlyContinue
-        Remove-Item function:global:ffprobe -ErrorAction SilentlyContinue
+        Remove-Item function:\yt-dlp -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
         $env:APPDATA = $script:OrigAppData
     }
 
@@ -2460,5 +2460,954 @@ Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
             $parsed[0].FailureKind | Should -Be 'Unknown'
             $parsed[0].RetryDecision | Should -Be 'Retry'
         }
+    }
+}
+
+# =====================================================================
+# Phase 4 - Delivery 3: FINAL BLOCK
+# Covers A1-A17, F10b, F13, F14, F16, F17, F30.
+# Apply after the closing '}' of 'Describe "Phase 4 - Delivery 2: ..."'
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# 1. Pure helpers: Add-CapturedLine (A1), Get-VerdictFailureClass (A3),
+#    Fixture roundtrip (A2), ANSI prefix (F17b)
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 3: Pure helpers' {
+
+    BeforeDiscovery {
+        $fixturesDir = Join-Path $PSScriptRoot 'Fixtures\yt-dlp'
+        $expectedTable = @{
+            'success-baseline'    = @{ FailureKind = 'None';          RetryDecision = 'None' }
+            'private-video'       = @{ FailureKind = 'Permanent';     RetryDecision = 'Stop' }
+            'invalid-id-truncated'= @{ FailureKind = 'Permanent';     RetryDecision = 'Stop' }
+            'age-restricted'      = @{ FailureKind = 'Configuration'; RetryDecision = 'Stop' }
+            'format-unavailable'  = @{ FailureKind = 'Configuration'; RetryDecision = 'Stop' }
+            'bad-option'          = @{ FailureKind = 'Configuration'; RetryDecision = 'Stop' }
+            'deleted-video'       = @{ FailureKind = 'Unknown';       RetryDecision = 'Retry' }
+            'nonexistent-id'      = @{ FailureKind = 'Unknown';       RetryDecision = 'Retry' }
+            'no-network'          = @{ FailureKind = 'Transient';     RetryDecision = 'Retry' }
+            'http-429'            = @{ FailureKind = 'Transient';     RetryDecision = 'Retry' }
+            'http-500'            = @{ FailureKind = 'Transient';     RetryDecision = 'Retry' }
+            'http-503'            = @{ FailureKind = 'Transient';     RetryDecision = 'Retry' }
+            'http-404'            = @{ FailureKind = 'Unknown';       RetryDecision = 'Retry' }
+        }
+        $script:A2Cases = @()
+        foreach ($file in (Get-ChildItem -LiteralPath $fixturesDir -Filter '*.txt' -File)) {
+            $raw = Get-Content -LiteralPath $file.FullName -Encoding UTF8 -Raw
+            $lines = $raw -split '\r?\n'
+            $sep = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^---\s*$') { $sep = $i; break }
+            }
+            if ($sep -lt 0) { continue }
+            $exitMatch = [regex]::Match(($lines[0..($sep-1)] -join "`n"), 'exit code:\s*(-?\d+)')
+            if (-not $exitMatch.Success) { continue }
+            $caseName = $file.BaseName
+            if (-not $expectedTable.ContainsKey($caseName)) { continue }
+            $script:A2Cases += @{
+                CaseName  = $caseName
+                ExitCode  = [int]$exitMatch.Groups[1].Value
+                BodyLines = @($lines[($sep + 1)..($lines.Count - 1)])
+                Expected  = $expectedTable[$caseName]
+            }
+        }
+    }
+
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    # ---------- A1: Add-CapturedLine ----------
+    It 'A1a Add-CapturedLine: null and empty inputs are ignored' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        Add-CapturedLine -Queue $q -Line $null
+        Add-CapturedLine -Queue $q -Line ''
+        Add-CapturedLine -Queue $q -Line '   '
+        $q.Count | Should -Be 0
+    }
+    It 'A1b Add-CapturedLine: non-matching lines are dropped' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        Add-CapturedLine -Queue $q -Line 'just info'
+        Add-CapturedLine -Queue $q -Line '[debug] downloading'
+        $q.Count | Should -Be 0
+    }
+    It 'A1c Add-CapturedLine: ERROR, WARNING, and yt-dlp parser lines are kept' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        Add-CapturedLine -Queue $q -Line 'ERROR: [youtube] abc: Private video'
+        Add-CapturedLine -Queue $q -Line 'WARNING: something'
+        Add-CapturedLine -Queue $q -Line 'yt-dlp.exe: error: no such option: --x'
+        $q.Count | Should -Be 3
+    }
+    It 'A1d Add-CapturedLine: cap 200 keeps the tail' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        for ($i = 1; $i -le 250; $i++) { Add-CapturedLine -Queue $q -Line "ERROR: line $i" }
+        $q.Count | Should -Be 200
+        $q.Peek() | Should -Match 'line 51$'
+    }
+    It 'A1e Add-CapturedLine: truncates to 1000 chars' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        Add-CapturedLine -Queue $q -Line ('ERROR: ' + ('x' * 2000))
+        $q.Peek().Length | Should -Be 1000
+    }
+    It 'A1f Add-CapturedLine: ErrorRecord input is coerced via string' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        $ex  = [System.Exception]::new('ERROR: fake')
+        $err = [System.Management.Automation.ErrorRecord]::new($ex, 'id', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        Add-CapturedLine -Queue $q -Line $err
+        $q.Count | Should -Be 1
+        $q.Peek() | Should -Match 'ERROR: fake'
+    }
+
+    # ---------- A3: Get-VerdictFailureClass ----------
+    It 'A3a Corrupt -> Transient/Retry' {
+        $r = Get-VerdictFailureClass -Outcome Corrupt
+        $r.FailureKind | Should -Be 'Transient'; $r.RetryDecision | Should -Be 'Retry'
+    }
+    It 'A3b QuarantineFailed -> Unknown/Retry' {
+        $r = Get-VerdictFailureClass -Outcome QuarantineFailed
+        $r.FailureKind | Should -Be 'Unknown'; $r.RetryDecision | Should -Be 'Retry'
+    }
+    It 'A3c NoOutput -> Unknown/Retry' {
+        $r = Get-VerdictFailureClass -Outcome NoOutput
+        $r.FailureKind | Should -Be 'Unknown'; $r.RetryDecision | Should -Be 'Retry'
+    }
+    It 'A3d OtherMode Case A -> Configuration/Stop' {
+        $r = Get-VerdictFailureClass -Outcome OtherMode -Case A
+        $r.FailureKind | Should -Be 'Configuration'; $r.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A3e OtherMode Case C -> Unknown/Retry' {
+        $r = Get-VerdictFailureClass -Outcome OtherMode -Case C
+        $r.FailureKind | Should -Be 'Unknown'; $r.RetryDecision | Should -Be 'Retry'
+    }
+    It 'A3f Unknown with ffprobe missing -> Configuration/Stop' {
+        $r = Get-VerdictFailureClass -Outcome Unknown -FfprobeAvailable $false
+        $r.FailureKind | Should -Be 'Configuration'; $r.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A3g Unknown with ffprobe present -> Unknown/Retry' {
+        $r = Get-VerdictFailureClass -Outcome Unknown -FfprobeAvailable $true
+        $r.FailureKind | Should -Be 'Unknown'; $r.RetryDecision | Should -Be 'Retry'
+    }
+
+    # ---------- A2: Fixture roundtrip through Add-CapturedLine ----------
+    It 'A2 capture roundtrip (<CaseName>) preserves classification' -ForEach $script:A2Cases {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        foreach ($line in $BodyLines) { Add-CapturedLine -Queue $q -Line $line }
+        $captured = Get-FailureKind -ExitCode $ExitCode -ErrorText @($q.ToArray())
+        $full     = Get-FailureKind -ExitCode $ExitCode -ErrorText @($BodyLines)
+        $captured.FailureKind   | Should -Be $full.FailureKind
+        $captured.RetryDecision | Should -Be $full.RetryDecision
+        $captured.FailureKind   | Should -Be $Expected.FailureKind
+        $captured.RetryDecision | Should -Be $Expected.RetryDecision
+    }
+
+    # ---------- F17b: ANSI prefix ----------
+    It 'F17b ANSI-prefixed ERROR: line passes Add-CapturedLine and classifies' {
+        $q = New-Object 'System.Collections.Generic.Queue[string]'
+        $ansiLine = "$([char]27)[31mERROR: [youtube] abc: Private video$([char]27)[0m"
+        Add-CapturedLine -Queue $q -Line $ansiLine
+        $q.Count | Should -Be 1
+        $r = Get-FailureKind -ExitCode 1 -ErrorText @($q.ToArray())
+        $r.FailureKind   | Should -Be 'Permanent'
+        $r.RetryDecision | Should -Be 'Stop'
+    }
+}
+
+
+# ---------------------------------------------------------------------
+# 2. Invoke-ItemDownload behavior (A4-A11, A13, A15, A16, F10b, F17a)
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 3: Invoke-ItemDownload behavior' {
+
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        function global:yt-dlp { }
+        function global:ffprobe { }
+        Mock Start-Sleep { }
+
+        function script:Install-YtDlpFixtureMock {
+            param([string]$FixtureName)
+            $fxDir = Join-Path $PSScriptRoot 'Fixtures\yt-dlp'
+            $raw   = Get-Content -LiteralPath (Join-Path $fxDir "$FixtureName.txt") -Encoding UTF8 -Raw
+            $lines = $raw -split '\r?\n'
+            $sep   = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^---\s*$') { $sep = $i; break } }
+            $body  = @($lines[($sep + 1)..($lines.Count - 1)])
+            $exit  = [int]([regex]::Match(($lines[0..($sep-1)] -join "`n"), 'exit code:\s*(-?\d+)').Groups[1].Value)
+            $script:FxExit = $exit
+            $script:FxBody = $body
+            Mock yt-dlp {
+                $global:LASTEXITCODE = $script:FxExit
+                foreach ($l in $script:FxBody) { $l }
+            }
+        }
+
+        function script:New-TestItem {
+            param(
+                [string]$Mode = 'Video',
+                [int]$MaxHeight = 720,
+                [string]$Destination = $null
+            )
+            if (-not $Destination) { $Destination = Join-Path $TestDrive 'dest' }
+            if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+            [PSCustomObject]@{
+                Id             = [guid]::NewGuid().ToString()
+                Url            = 'https://youtube.com/watch?v=AbC12345678'
+                Mode           = $Mode
+                MaxHeight      = $MaxHeight
+                AudioFormat    = 'MP3'
+                Bitrate        = 128
+                Destination    = $Destination
+                Status         = 'Pending'
+                Error          = ''
+                OutputFilePath = ''
+                VideoId        = 'AbC12345678'
+                RetryCount     = 0
+                AttemptCount   = 0
+                FailureKind    = 'None'
+                RetryDecision  = 'None'
+            }
+        }
+
+        function script:Set-ManifestForItem {
+            param($Item)
+            $script:Manifest = @($Item)
+            [void](Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest)
+        }
+    }
+
+    AfterAll {
+        Remove-Item function:\yt-dlp  -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
+        $env:APPDATA = $script:OrigAppData
+    }
+
+    BeforeEach {
+        $script:Config.MaxRetries = 3
+        if (Test-Path $script:ManifestPath) { Remove-Item $script:ManifestPath -Force }
+    }
+
+
+    # ---------- Sanity: fixture mock registers ----------
+    It 'A4-pre sanity: fixture mock intercepts yt-dlp' -Tag FixtureSanity {
+        Install-YtDlpFixtureMock -FixtureName 'private-video'
+        $global:LASTEXITCODE = $null
+        & yt-dlp 'https://example.invalid/watch?v=x' 2>&1 | Out-Null
+        $LASTEXITCODE | Should -Be 1
+        Should -Invoke yt-dlp -Times 1 -Exactly
+    }
+
+    # ---------- A4: private video, 1 attempt, Permanent/Stop ----------
+    It 'A4 private video -> Permanent/Stop, 1 attempt, retry-skipped message' {
+        Install-YtDlpFixtureMock -FixtureName 'private-video'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 1 -Exactly
+        $item.Status         | Should -Be 'Failed'
+        $item.FailureKind    | Should -Be 'Permanent'
+        $item.RetryDecision  | Should -Be 'Stop'
+        $item.Error          | Should -Match 'retry skipped \(FailureKind=Permanent, attempt 1/4\)'
+    }
+
+    # ---------- A5: format-unavailable and bad-option, Configuration/Stop ----------
+    It 'A5a format-unavailable -> Configuration/Stop, 1 attempt' {
+        Install-YtDlpFixtureMock -FixtureName 'format-unavailable'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 1 -Exactly
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A5b bad-option (exit 2) -> Configuration/Stop, 1 attempt' {
+        Install-YtDlpFixtureMock -FixtureName 'bad-option'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 1 -Exactly
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+
+    # ---------- A6: no-network, 4 attempts, Transient/Retry ----------
+    It 'A6 no-network -> Transient/Retry, 4 attempts, exhaustion message' {
+        Install-YtDlpFixtureMock -FixtureName 'no-network'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 4 -Exactly
+        $item.FailureKind   | Should -Be 'Transient'
+        $item.RetryDecision | Should -Be 'Retry'
+        $item.Error         | Should -Match 'attempt budget 4/4 exhausted'
+    }
+
+    # ---------- A7: deleted-video, 4 attempts, Unknown/Retry ----------
+    It 'A7 deleted-video -> Unknown/Retry, 4 attempts' {
+        Install-YtDlpFixtureMock -FixtureName 'deleted-video'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 4 -Exactly
+        $item.FailureKind   | Should -Be 'Unknown'
+        $item.RetryDecision | Should -Be 'Retry'
+    }
+
+    # ---------- A8: Test-3, Case C OtherMode then Case A OtherMode ----------
+    It 'A8 Case C OtherMode then Case A OtherMode -> 2 attempts, Configuration/Stop' {
+        $script:ytCall = 0
+        $script:retryFile = Join-Path (Join-Path $TestDrive 'dest') 'retry_AbC12345678.m4a'
+        Mock yt-dlp {
+            $script:ytCall++
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                if ($script:ytCall -ge 2) {
+                    Set-Content -Path $script:retryFile -Value 'x' -Force
+                    $script:retryFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+                }
+            }
+        }
+        Mock Test-IdInArchive { @{ Status = 'Found' } }
+        Mock Find-OutputCandidates {
+            @([PSCustomObject]@{
+                File    = [PSCustomObject]@{ Name='a_AbC12345678.mp4'; FullName='x'; LastWriteTimeUtc=(Get-Date).ToUniversalTime() }
+                Verdict = 'OtherMode'
+                Reason  = 'contains video stream'
+            })
+        }
+        Mock Remove-VideoIdFromArchive { $true }
+        Mock Get-FileVerdict { @{ Verdict='OtherMode'; Reason='contains video stream' } }
+        Mock Test-FfprobeAvailable { $true }
+        Mock Write-Log { }
+        $item = New-TestItem -Mode 'Audio' -MaxHeight 0
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 2 -Exactly
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+        $item.AttemptCount  | Should -Be 2
+        $item.Error         | Should -Match 'attempt 2/4'
+    }
+
+    # ---------- A9: Case A Unknown, ffprobe missing vs present ----------
+    It 'A9a Case A Unknown, ffprobe missing -> Configuration/Stop, 1 attempt' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { @{ Verdict='Unknown'; Reason='ffprobe failed' } }
+        Mock Test-FfprobeAvailable { $false }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 1 -Exactly
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A9b Case A Unknown, ffprobe present -> Unknown/Retry, 4 attempts' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { @{ Verdict='Unknown'; Reason='ffprobe failed' } }
+        Mock Test-FfprobeAvailable { $true }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 4 -Exactly
+        $item.FailureKind   | Should -Be 'Unknown'
+        $item.RetryDecision | Should -Be 'Retry'
+    }
+
+    # ---------- A10: private text + Corrupt -> Permanent/Stop wins ----------
+    It 'A10 private text + Corrupt isolated -> Permanent/Stop wins (1 attempt)' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 1
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FailureKind { @{ FailureKind='Permanent'; RetryDecision='Stop'; Reason='private video'; Evidence='ERROR: Private video' } }
+        Mock Get-FileVerdict { @{ Verdict='Corrupt'; Reason='0 packets' } }
+        Mock Move-ToInvalid { @{ Success=$true; NewPath='x.invalid_123'; Error=$null } }
+        Mock Remove-VideoIdFromArchive { $true }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 1 -Exactly
+        $item.FailureKind   | Should -Be 'Permanent'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+
+    # ---------- A11: Stop at attempt 4/4 ----------
+    It 'A11 Stop decided at attempt 4/4 -> exhaustion message, pair persisted' {
+        Mock yt-dlp { $global:LASTEXITCODE = 1 } 
+        $script:gkCall = 0
+        Mock Get-FailureKind {
+            $script:gkCall++
+            if ($script:gkCall -lt 4) { @{ FailureKind='Transient'; RetryDecision='Retry'; Reason='net' } }
+            else                       { @{ FailureKind='Configuration'; RetryDecision='Stop'; Reason='last' } }
+        }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 4 -Exactly
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+        $item.Error         | Should -Match 'attempt budget 4/4 exhausted'
+    }
+
+    # ---------- A13: AttemptCount persisted before each yt-dlp call ----------
+    It 'A13a AttemptCount is persisted to manifest before yt-dlp call' {
+        $script:testGuid = $null
+        $script:savedAtCall = $null
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $m = Get-Content -LiteralPath $script:ManifestPath -Raw | ConvertFrom-Json
+            $script:savedAtCall = (@($m) | Where-Object { $_.Id -eq $script:testGuid }).AttemptCount
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { @{ Verdict='Valid'; Reason='OK' } }
+        Mock Test-FileValidity { $true }
+        $script:Config.MaxRetries = 0
+        $item = New-TestItem
+        $script:testGuid = $item.Id
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $script:savedAtCall | Should -Be 1
+    }
+    It 'A13b Early stop leaves AttemptCount at 1' {
+        Install-YtDlpFixtureMock -FixtureName 'private-video'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.AttemptCount | Should -Be 1
+        $m = Get-Content -LiteralPath $script:ManifestPath -Raw | ConvertFrom-Json
+        (@($m) | Where-Object { $_.Id -eq $item.Id }).AttemptCount | Should -Be 1
+    }
+
+    It 'A13c 4-attempt retry persists AttemptCount=4 and Failed' {
+        Install-YtDlpFixtureMock -FixtureName 'no-network'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Out-Null
+
+        $item.AttemptCount | Should -Be 4
+        $saved = Get-Content -LiteralPath $script:ManifestPath -Raw | ConvertFrom-Json
+        $entry = @($saved) | Where-Object { $_.Id -eq $item.Id }
+        $entry.AttemptCount | Should -Be 4
+        $entry.Status       | Should -Be 'Failed'
+    }
+
+    It 'A13d Pending rows persisted as None/None with attempt 1,2,3' {
+        Install-YtDlpFixtureMock -FixtureName 'no-network'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        $script:a13Id = $item.Id
+        $script:pendingRows = @()
+        Mock Start-Sleep {
+            $m = Get-Content -LiteralPath $script:ManifestPath -Raw | ConvertFrom-Json
+            $row = @($m) | Where-Object { $_.Id -eq $script:a13Id }
+            $script:pendingRows += [PSCustomObject]@{ S=$row.Status; FK=$row.FailureKind; RD=$row.RetryDecision; AC=$row.AttemptCount }
+        }
+        Invoke-ItemDownload -Item $item | Out-Null
+        $script:pendingRows.Count | Should -Be 3
+        (($script:pendingRows | ForEach-Object { $_.AC }) -join ',') | Should -Be '1,2,3'
+        foreach ($r in $script:pendingRows) { $r.S | Should -Be 'Pending'; $r.FK | Should -Be 'None'; $r.RD | Should -Be 'None' }
+    }
+
+    # ---------- A15: Success paths -> None/None ----------
+    It 'A15a Case A Valid -> Success/None/None' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { @{ Verdict='Valid'; Reason='OK' } }
+        Mock Test-FileValidity { $true }
+        $script:Config.MaxRetries = 0
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status        | Should -Be 'Success'
+        $item.FailureKind   | Should -Be 'None'
+        $item.RetryDecision | Should -Be 'None'
+    }
+    It 'A15b Case C Valid (archive) -> Success/None/None' {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) { 'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8 }
+        }
+        Mock Test-IdInArchive { @{ Status = 'Found' } }
+        Mock Find-OutputCandidates {
+            @([PSCustomObject]@{
+                File    = [PSCustomObject]@{ Name='v_AbC12345678.mp4'; FullName='x'; LastWriteTimeUtc=(Get-Date).ToUniversalTime() }
+                Verdict = 'Valid'
+                Reason  = 'OK'
+            })
+        }
+        Mock Test-FileValidity { $true }
+        $script:Config.MaxRetries = 0
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        $item.Status        | Should -Be 'Success'
+        $item.FailureKind   | Should -Be 'None'
+        $item.RetryDecision | Should -Be 'None'
+    }
+    It 'A15c Existing-output shortcut -> Success/None/None' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'existing_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock Test-FileValidity { $true }
+        Mock yt-dlp { } 
+        $item = New-TestItem
+        $item.OutputFilePath = $script:goodFile
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeTrue
+        Should -Invoke yt-dlp -Times 0 -Exactly
+        $item.Status        | Should -Be 'Success'
+        $item.FailureKind   | Should -Be 'None'
+        $item.RetryDecision | Should -Be 'None'
+    }
+
+    # ---------- A16: [Retry] log format (F15) ----------
+    It 'A16a [Retry] logged exactly once with period format (MaxRetries=0)' {
+        $script:Config.MaxRetries = 0
+        Install-YtDlpFixtureMock -FixtureName 'no-network'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -match '^\[Retry\] FailureKind: Transient\. Decision: Retry\. Reason: .+'
+        }
+    }
+    It 'A16b [Retry] logged once per failed attempt on 4-attempt run' {
+        Install-YtDlpFixtureMock -FixtureName 'no-network'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke Write-Log -Times 4 -Exactly -ParameterFilter {
+            $Message -match '^\[Retry\] FailureKind: .+\. Decision: .+\. Reason: .+'
+        }
+    }
+
+    It 'F4-regression archive Rule 4 no candidates -> [Retry] once per attempt, not twice' {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) { 'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8 }
+        }
+        Mock Test-IdInArchive { @{ Status = 'Found' } }
+        Mock Find-OutputCandidates { @() }
+        Mock Remove-VideoIdFromArchive { $true }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp                  -Times 4 -Exactly
+        Should -Invoke Remove-VideoIdFromArchive -Times 4 -Exactly
+        # Pre-F4 this would be 7: attempts 1-3 logged twice, attempt 4 once.
+        Should -Invoke Write-Log               -Times 4 -Exactly -ParameterFilter {
+            $Message -match '^\[Retry\] FailureKind: Unknown\. Decision: Retry\. Reason: '
+        }
+    }
+
+    # ---------- F10b: CommandNotFoundException -> Configuration/Stop ----------
+    It 'F10b Mock-throw CommandNotFoundException -> Configuration/Stop, 1 attempt' {
+        Mock yt-dlp { throw [System.Management.Automation.CommandNotFoundException]::new('yt-dlp') }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        Should -Invoke yt-dlp -Times 1 -Exactly
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+        $item.Error         | Should -Match 'yt-dlp not found'
+    }
+
+    # ---------- F17a: single boolean return on every exit path ----------
+    It 'F17a Stop path returns exactly one boolean' {
+        Install-YtDlpFixtureMock -FixtureName 'private-video'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        @(Invoke-ItemDownload -Item $item).Count | Should -Be 1
+    }
+    It 'F17a Exhaustion path returns exactly one boolean' {
+        Install-YtDlpFixtureMock -FixtureName 'no-network'
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        @(Invoke-ItemDownload -Item $item).Count | Should -Be 1
+    }
+    It 'F17a Success path returns exactly one boolean' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { @{ Verdict='Valid'; Reason='OK' } }
+        Mock Test-FileValidity { $true }
+        $script:Config.MaxRetries = 0
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        @(Invoke-ItemDownload -Item $item).Count | Should -Be 1
+    }
+    It 'F17a Archive path returns exactly one boolean' {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) { 'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8 }
+        }
+        Mock Test-IdInArchive { @{ Status = 'Found' } }
+        Mock Find-OutputCandidates { @() }
+        Mock Remove-VideoIdFromArchive { $true }
+        Mock Write-Log { }
+        $script:Config.MaxRetries = 0
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        @(Invoke-ItemDownload -Item $item).Count | Should -Be 1
+    }
+}
+
+
+# ---------------------------------------------------------------------
+# 3. Pair persistence at 3 early sites + 4 cleanup sites (A12, F16)
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 3: Pair persistence at all sites' {
+
+    BeforeDiscovery {
+        try {
+            [System.IO.Path]::GetFullPath("C:\x$([char]0)y") | Out-Null
+            $script:NullCharThrows = $false
+        } catch { $script:NullCharThrows = $true }
+    }
+
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        function global:yt-dlp { }
+        function global:ffprobe { }
+        Mock Start-Sleep { }
+
+        function script:New-TestItem {
+            param([string]$Mode = 'Video', [int]$MaxHeight = 720, [string]$Destination = $null)
+            if (-not $Destination) { $Destination = Join-Path $TestDrive 'dest' }
+            if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+            [PSCustomObject]@{
+                Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=AbC12345678';
+                Mode=$Mode; MaxHeight=$MaxHeight; AudioFormat='MP3'; Bitrate=128;
+                Destination=$Destination; Status='Pending'; Error=''; OutputFilePath='';
+                VideoId='AbC12345678'; RetryCount=0; AttemptCount=0;
+                FailureKind='None'; RetryDecision='None'
+            }
+        }
+        function script:Set-ManifestForItem { param($Item) $script:Manifest = @($Item); [void](Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest) }
+    }
+    AfterAll {
+        Remove-Item function:\yt-dlp  -ErrorAction SilentlyContinue
+        Remove-Item function:\ffprobe -ErrorAction SilentlyContinue
+        $env:APPDATA = $script:OrigAppData
+    }
+    BeforeEach {
+        $script:Config.MaxRetries = 0
+        if (Test-Path $script:ManifestPath) { Remove-Item $script:ManifestPath -Force }
+    }
+
+    It 'A12a No destination -> Configuration/Stop' {
+        $item = New-TestItem; $item.Destination = ''
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A12b Invalid destination -> Configuration/Stop' -Skip:(-not $script:NullCharThrows) {
+        $item = New-TestItem; $item.Destination = "C:\x$([char]0)y"
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Configuration'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A12c Cannot extract video id -> Permanent/Stop' {
+        Mock Get-VideoId { '' }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Permanent'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A12d Archive read error -> Unknown/Stop' {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) { 'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8 }
+        }
+        Mock Test-IdInArchive { @{ Status = 'ReadError' } }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Unknown'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A12e Case A corrupt archive-cleanup failure -> Unknown/Stop' {
+        $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'vid_AbC12345678.mp4'
+        Set-Content -Path $script:goodFile -Value 'x' -Force
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) {
+                'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8
+                $script:goodFile | Out-File -FilePath $args[$i+5] -Encoding UTF8
+            }
+        }
+        Mock Get-FileVerdict { @{ Verdict='Corrupt'; Reason='0 packets' } }
+        Mock Move-ToInvalid { @{ Success=$true; NewPath='x.invalid_123'; Error=$null } }
+        Mock Remove-VideoIdFromArchive { $false }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Unknown'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A12f Case C corrupt archive-cleanup failure -> Unknown/Stop' {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) { 'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8 }
+        }
+        Mock Test-IdInArchive { @{ Status = 'Found' } }
+        Mock Find-OutputCandidates {
+            @([PSCustomObject]@{
+                File    = [PSCustomObject]@{ Name='c_AbC12345678.mp4'; FullName='x'; LastWriteTimeUtc=(Get-Date).ToUniversalTime() }
+                Verdict = 'Corrupt'; Reason = 'bad'
+            })
+        }
+        Mock Move-ToInvalid { @{ Success=$true; NewPath='c.invalid'; Error=$null } }
+        Mock Remove-VideoIdFromArchive { $false }
+        Mock Write-Log { }
+        $item = New-TestItem
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Unknown'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+    It 'A12g Case C OtherMode archive-cleanup failure -> Unknown/Stop' {
+        Mock yt-dlp {
+            $global:LASTEXITCODE = 0
+            $i = [array]::IndexOf($args, '--print-to-file')
+            if ($i -ge 0) { 'AbC12345678' | Out-File -FilePath $args[$i+2] -Encoding UTF8 }
+        }
+        Mock Test-IdInArchive { @{ Status = 'Found' } }
+        Mock Find-OutputCandidates {
+            @([PSCustomObject]@{
+                File    = [PSCustomObject]@{ Name='om_AbC12345678.mp4'; FullName='x'; LastWriteTimeUtc=(Get-Date).ToUniversalTime() }
+                Verdict = 'OtherMode'; Reason = 'video only'
+            })
+        }
+        Mock Remove-VideoIdFromArchive { $false }
+        Mock Write-Log { }
+        $item = New-TestItem -Mode 'Audio' -MaxHeight 0
+        Set-ManifestForItem $item
+        Invoke-ItemDownload -Item $item | Should -BeFalse
+        $item.FailureKind   | Should -Be 'Unknown'
+        $item.RetryDecision | Should -Be 'Stop'
+    }
+}
+
+
+# ---------------------------------------------------------------------
+# 4. Stop-ItemEarly (A14)
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 3: Stop-ItemEarly' {
+
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    It 'A14a returns exactly one $false' {
+        Mock Set-ItemState { $true }
+        Mock Write-Log { }
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=AbC12345678' }
+        $r = @(Stop-ItemEarly -Item $item -Reason 'x' -FailureKind 'Permanent' -AttemptNumber 1 -MaxAttempts 4)
+        $r.Count | Should -Be 1
+        $r[0]    | Should -BeFalse
+    }
+    It 'A14b Set-ItemState failure logs CRITICAL, still returns $false' {
+        Mock Set-ItemState { $false }
+        Mock Write-Log { }
+        $item = [PSCustomObject]@{ Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=AbC12345678' }
+        $r = @(Stop-ItemEarly -Item $item -Reason 'x' -FailureKind 'Permanent' -AttemptNumber 1 -MaxAttempts 4)
+        $r.Count | Should -Be 1
+        $r[0]    | Should -BeFalse
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -like 'CRITICAL*' }
+    }
+}
+
+
+# ---------------------------------------------------------------------
+# 5. F17c: CommandNotFoundException type contract
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 3: CommandNotFoundException type contract' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA; $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    It 'F17c invoking an absent command throws CommandNotFoundException' {
+        $threw = $false
+        $saved = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Stop'
+            & yt-dlp-no-such-command-xyz 2>$null
+        } catch [System.Management.Automation.CommandNotFoundException] {
+            $threw = $true
+        } finally {
+            $ErrorActionPreference = $saved
+        }
+        $threw | Should -BeTrue
+    }
+}
+
+
+# ---------------------------------------------------------------------
+# 6. F13: production EAP guard proof (PS 5.1 shim). F18-F29 folded in.
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 3: Production EAP capture under Stop' {
+
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        Mock Start-Sleep { }
+
+        $script:shimDir    = Join-Path $TestDrive 'bin'
+        New-Item -ItemType Directory -Path $script:shimDir -Force | Out-Null
+        $script:counterFile = Join-Path $TestDrive 'shim-counter.txt'
+
+        # F28: counter increments BEFORE stderr write, so mutated run reliably records 4
+        $shim = @'
+@echo off
+echo call>>"%~dp0..\shim-counter.txt"
+echo ERROR: [youtube] x: Private video 1>&2
+exit /b 1
+'@
+        Set-Content -LiteralPath (Join-Path $script:shimDir 'yt-dlp.cmd') -Value $shim -Encoding ASCII
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    It 'F13 real Invoke-ItemDownload classifies Permanent/Stop via shim under EAP=Stop' -Tag F13Mutation {
+        Remove-Item -LiteralPath $script:counterFile -ErrorAction SilentlyContinue   # F27
+
+        $item = [PSCustomObject]@{
+            Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=AbC12345678';
+            Mode='Video'; MaxHeight=0; AudioFormat=''; Bitrate=0;
+            Destination=$TestDrive; Status='Pending'; Error=''; OutputFilePath='';
+            VideoId='AbC12345678'; RetryCount=0; AttemptCount=0;
+            FailureKind='None'; RetryDecision='None'
+        }
+        $script:Manifest = @($item)
+        [void](Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest)   # F23
+        $script:Config.MaxRetries = 3
+
+        $savedFn   = Get-Command yt-dlp -CommandType Function -ErrorAction SilentlyContinue
+        $savedPath = $env:Path
+        $savedEAP  = $ErrorActionPreference
+        try {
+            if ($savedFn) { Remove-Item function:\yt-dlp -Force }
+            $env:Path = "$script:shimDir;$savedPath"
+            $ErrorActionPreference = 'Stop'
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+        } finally {
+            $ErrorActionPreference = $savedEAP
+            $env:Path = $savedPath
+            if ($savedFn) { function global:yt-dlp { } }
+        }
+
+        (Get-Content -LiteralPath $script:counterFile | Measure-Object -Line).Lines | Should -Be 1
+        $item.Status        | Should -Be 'Failed'
+        $item.FailureKind   | Should -Be 'Permanent'
+        $item.RetryDecision | Should -Be 'Stop'
+        $item.Error         | Should -Match 'retry skipped'
     }
 }
