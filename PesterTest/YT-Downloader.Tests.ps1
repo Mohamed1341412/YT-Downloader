@@ -3366,12 +3366,12 @@ Describe 'Phase 4 - Delivery 3: Production EAP capture under Stop' {
         $script:counterFile = Join-Path $TestDrive 'shim-counter.txt'
 
         # F28: counter increments BEFORE stderr write, so mutated run reliably records 4
-        $shim = @'
-@echo off
-echo call>>"%~dp0..\shim-counter.txt"
-echo ERROR: [youtube] x: Private video 1>&2
-exit /b 1
-'@
+        $shim = @(
+            '@echo off'
+            'echo call>>"%~dp0..\shim-counter.txt"'
+            'echo ERROR: [youtube] x: Private video 1>&2'
+            'exit /b 1'
+        ) -join "`r`n"
         Set-Content -LiteralPath (Join-Path $script:shimDir 'yt-dlp.cmd') -Value $shim -Encoding ASCII
     }
     AfterAll { $env:APPDATA = $script:OrigAppData }
@@ -3396,6 +3396,7 @@ exit /b 1
         try {
             if ($savedFn) { Remove-Item function:\yt-dlp -Force }
             $env:Path = "$script:shimDir;$savedPath"
+            (Get-Command yt-dlp).Source | Should -Be (Join-Path $script:shimDir 'yt-dlp.cmd')
             $ErrorActionPreference = 'Stop'
             Invoke-ItemDownload -Item $item | Should -BeFalse
         } finally {
