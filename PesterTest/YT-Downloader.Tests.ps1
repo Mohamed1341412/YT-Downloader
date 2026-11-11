@@ -3808,7 +3808,7 @@ Describe 'Phase 4 - Delivery 4: Get-RetrySkipSummary' {
             param(
                 [string]$SkipReason = 'Stop',
                 [string]$FailureKind = 'Permanent',
-                [string]$Error = 'err',
+                [string]$ErrorMessage = 'err',
                 [string]$VideoId = 'vid',
                 [string]$Url = 'url',
                 [int]$AttemptCount = 1
@@ -3818,7 +3818,7 @@ Describe 'Phase 4 - Delivery 4: Get-RetrySkipSummary' {
                 Url          = $Url
                 VideoId      = $VideoId
                 FailureKind  = $FailureKind
-                Error        = $Error
+                Error        = $ErrorMessage
                 AttemptCount = $AttemptCount
                 SkipReason   = $SkipReason
             }
