@@ -1917,8 +1917,8 @@ Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
             $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
             Test-ManifestSchema -Data @($item) | Should -BeTrue
         }
-        It 'Pending with Transient/Retry survives load, copy, save' {
-            $item = New-LegacyItem -Status 'Pending'
+        It 'Failed with Transient/Retry survives load, copy, save' {
+            $item = New-LegacyItem -Status 'Failed'
             $item | Add-Member -NotePropertyName FailureKind -NotePropertyValue 'Transient'
             $item | Add-Member -NotePropertyName RetryDecision -NotePropertyValue 'Retry'
             $script:Manifest = @($item)
@@ -2066,14 +2066,14 @@ Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
             $item.FailureKind | Should -Be 'None'
             $item.RetryDecision | Should -Be 'None'
         }
-        It 'Downloading with valid passed values stores them' {
+        It 'Downloading with passed Transient/Retry is overridden to None/None' {
             $item = New-LegacyItem -Status 'Pending'
             $script:Manifest = @($item)
             Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
             $result = Set-ItemState -Item $item -Status 'Downloading' -FailureKind 'Transient' -RetryDecision 'Retry'
             $result | Should -BeTrue
-            $item.FailureKind | Should -Be 'Transient'
-            $item.RetryDecision | Should -Be 'Retry'
+            $item.FailureKind | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
         }
         It 'Failed without passed fields gives Unknown/Retry and logs warning' {
             Mock Write-Log { }
@@ -2097,21 +2097,21 @@ Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
             $item.FailureKind | Should -Be 'Permanent'
             $item.RetryDecision | Should -Be 'Stop'
         }
-        It 'Pending with valid passed values stores them' {
+        It 'Pending with passed Transient/Retry is overridden to None/None' {
             $item = New-LegacyItem -Status 'Pending'
             $script:Manifest = @($item)
             Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
             $result = Set-ItemState -Item $item -Status 'Pending' -FailureKind 'Transient' -RetryDecision 'Retry'
             $result | Should -BeTrue
-            $item.FailureKind | Should -Be 'Transient'
-            $item.RetryDecision | Should -Be 'Retry'
+            $item.FailureKind | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
         }
         It 'Only FailureKind passed: keeps it, fills RetryDecision=Retry, logs warning' {
             Mock Write-Log { }
-            $item = New-LegacyItem -Status 'Pending'
+            $item = New-LegacyItem -Status 'Failed'
             $script:Manifest = @($item)
             Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
-            $result = Set-ItemState -Item $item -Status 'Pending' -FailureKind 'Permanent'
+            $result = Set-ItemState -Item $item -Status 'Failed' -FailureKind 'Permanent'
             $result | Should -BeTrue
             $item.FailureKind | Should -Be 'Permanent'
             $item.RetryDecision | Should -Be 'Retry'
@@ -2121,10 +2121,10 @@ Describe 'Phase 4 - Delivery 2: FailureKind and RetryDecision' {
         }
         It 'Only RetryDecision passed: fills FailureKind=Unknown, keeps it, logs warning' {
             Mock Write-Log { }
-            $item = New-LegacyItem -Status 'Pending'
+            $item = New-LegacyItem -Status 'Failed'
             $script:Manifest = @($item)
             Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest
-            $result = Set-ItemState -Item $item -Status 'Pending' -RetryDecision 'Stop'
+            $result = Set-ItemState -Item $item -Status 'Failed' -RetryDecision 'Stop'
             $result | Should -BeTrue
             $item.FailureKind | Should -Be 'Unknown'
             $item.RetryDecision | Should -Be 'Stop'
@@ -3410,5 +3410,745 @@ Describe 'Phase 4 - Delivery 3: Production EAP capture under Stop' {
         $item.FailureKind   | Should -Be 'Permanent'
         $item.RetryDecision | Should -Be 'Stop'
         $item.Error         | Should -Match 'retry skipped'
+    }
+}
+
+# =====================================================================
+# Phase 4 - Delivery 4: Retry Gate & Force Override (A1-A14, M1, M2)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# A2a / A2b: Normalize-FailureClassification changes
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: Normalize-FailureClassification' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    Context 'A2a Failed + one None -> Unknown/Retry Reason=FailedNone' {
+        It 'Failed+<FK>/<RD> -> Unknown/Retry Reason=FailedNone' -ForEach @(
+            @{ FK = 'Transient'; RD = 'None' },
+            @{ FK = 'Permanent'; RD = 'None' },
+            @{ FK = 'None';      RD = 'Retry' },
+            @{ FK = 'None';      RD = 'Stop' },
+            @{ FK = 'None';      RD = 'None' }
+        ) {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind $FK -RetryDecision $RD
+            $r.FailureKind   | Should -Be 'Unknown'
+            $r.RetryDecision | Should -Be 'Retry'
+            $r.Reason        | Should -Be 'FailedNone'
+        }
+
+        It 'Failed+Permanent/Stop unchanged (neither is None)' {
+            $r = Normalize-FailureClassification -Status 'Failed' -FailureKind 'Permanent' -RetryDecision 'Stop'
+            $r.FailureKind   | Should -Be 'Permanent'
+            $r.RetryDecision | Should -Be 'Stop'
+            $r.Reason        | Should -Be 'Valid'
+        }
+    }
+
+    Context 'A2b Pending/Downloading always None/None' {
+        It '<Status> with Permanent/Stop -> None/None Reason=Valid' -ForEach @(
+            @{ Status = 'Pending'     },
+            @{ Status = 'Downloading' }
+        ) {
+            $r = Normalize-FailureClassification -Status $Status -FailureKind 'Permanent' -RetryDecision 'Stop'
+            $r.FailureKind   | Should -Be 'None'
+            $r.RetryDecision | Should -Be 'None'
+            $r.Reason        | Should -Be 'Valid'
+        }
+
+        It '<Status> with Transient/Retry -> None/None Reason=Valid' -ForEach @(
+            @{ Status = 'Pending'     },
+            @{ Status = 'Downloading' }
+        ) {
+            $r = Normalize-FailureClassification -Status $Status -FailureKind 'Transient' -RetryDecision 'Retry'
+            $r.FailureKind   | Should -Be 'None'
+            $r.RetryDecision | Should -Be 'None'
+            $r.Reason        | Should -Be 'Valid'
+        }
+
+        It '<Status> with invalid values -> None/None Reason=Invalid' -ForEach @(
+            @{ Status = 'Pending'     },
+            @{ Status = 'Downloading' }
+        ) {
+            $r = Normalize-FailureClassification -Status $Status -FailureKind 'garbage' -RetryDecision 'alsobad'
+            $r.FailureKind   | Should -Be 'None'
+            $r.RetryDecision | Should -Be 'None'
+            $r.Reason        | Should -Be 'Invalid'
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# A2a / A2b: Set-ItemState changes
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: Set-ItemState' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+        Mock Test-FileValidity { $true }
+
+        function script:D4-NewItem {
+            param([string]$Status = 'Pending', [string]$FK = 'None', [string]$RD = 'None')
+            [PSCustomObject]@{
+                Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=AbC12345678';
+                Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0;
+                Destination=$TestDrive; Status=$Status; Error=''; OutputFilePath='';
+                VideoId='AbC12345678'; RetryCount=0; AttemptCount=0;
+                FailureKind=$FK; RetryDecision=$RD
+            }
+        }
+        function script:D4-SetupItem {
+            param($Item)
+            $script:Manifest = @($Item)
+            [void](Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest)
+        }
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    BeforeEach {
+        $script:Config.MaxRetries = 3
+        $script:StateInitialized = $true
+        if (Test-Path $script:ManifestPath) { Remove-Item $script:ManifestPath -Force }
+    }
+
+    Context 'A2a explicit-pair with one None -> Unknown/Retry' {
+        It 'Failed+<FK>/<RD> explicit pair -> Unknown/Retry' -ForEach @(
+            @{ FK = 'Transient'; RD = 'None' },
+            @{ FK = 'Permanent'; RD = 'None' },
+            @{ FK = 'None';      RD = 'Retry' },
+            @{ FK = 'None';      RD = 'Stop' },
+            @{ FK = 'None';      RD = 'None' }
+        ) {
+            $item = D4-NewItem; D4-SetupItem $item
+            $r = Set-ItemState -Item $item -Status 'Failed' -FailureKind $FK -RetryDecision $RD
+            $r | Should -BeTrue
+            $item.FailureKind   | Should -Be 'Unknown'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+
+        It 'Failed with RetryDecision-only None -> Unknown/Retry' {
+            $item = D4-NewItem; D4-SetupItem $item
+            $r = Set-ItemState -Item $item -Status 'Failed' -RetryDecision 'None'
+            $r | Should -BeTrue
+            $item.FailureKind   | Should -Be 'Unknown'
+            $item.RetryDecision | Should -Be 'Retry'
+        }
+    }
+
+    Context 'A2b Pending/Downloading overrides any passed pair' {
+        It '<Status> with Permanent/Stop passed -> None/None' -ForEach @(
+            @{ Status = 'Pending'     },
+            @{ Status = 'Downloading' }
+        ) {
+            $item = D4-NewItem; D4-SetupItem $item
+            $r = Set-ItemState -Item $item -Status $Status -FailureKind 'Permanent' -RetryDecision 'Stop'
+            $r | Should -BeTrue
+            $item.FailureKind   | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+
+        It '<Status> overrides invalid stored values -> None/None' -ForEach @(
+            @{ Status = 'Pending'     },
+            @{ Status = 'Downloading' }
+        ) {
+            $item = D4-NewItem -FK 'garbage' -RD 'alsobad'
+            D4-SetupItem $item
+            $r = Set-ItemState -Item $item -Status $Status
+            $r | Should -BeTrue
+            $item.FailureKind   | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+
+        It 'Set-ItemState still rejects non-canonical FailureKind before the Pending override' {
+            $item = D4-NewItem; D4-SetupItem $item
+            $before = Get-Content -LiteralPath $script:ManifestPath -Raw
+            $r = Set-ItemState -Item $item -Status 'Pending' -FailureKind 'permanent' -RetryDecision 'Retry'
+            $r | Should -BeFalse
+            (Get-Content -LiteralPath $script:ManifestPath -Raw) | Should -Be $before
+            $item.FailureKind   | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+
+        It 'Set-ItemState still rejects non-canonical RetryDecision before the Downloading override' {
+            $item = D4-NewItem; D4-SetupItem $item
+            $r = Set-ItemState -Item $item -Status 'Downloading' -FailureKind 'Transient' -RetryDecision 'retry'
+            $r | Should -BeFalse
+            $item.FailureKind   | Should -Be 'None'
+            $item.RetryDecision | Should -Be 'None'
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# A1, A3, A4, A4b, A5, A6, A10, A12: Get-RetryPlan changes
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: Get-RetryPlan' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+
+        function script:D4-ManifestItem {
+            param(
+                [string]$Status = 'Failed',
+                [string]$FK = 'Transient',
+                [string]$RD = 'Retry',
+                [int]$AttemptCount = 1,
+                [int]$RetryCount = 0,
+                [string]$VideoId = 'AbC12345678',
+                [string]$Url = 'https://youtube.com/watch?v=AbC12345678',
+                [string]$OutputFilePath = ''
+            )
+            [PSCustomObject]@{
+                Id=[guid]::NewGuid().ToString(); Url=$Url;
+                Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0;
+                Destination=$TestDrive; Status=$Status; Error=''; OutputFilePath=$OutputFilePath;
+                VideoId=$VideoId; RetryCount=$RetryCount; AttemptCount=$AttemptCount;
+                FailureKind=$FK; RetryDecision=$RD
+            }
+        }
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    BeforeEach { $script:Config.MaxRetries = 3 }
+
+    Context 'A1 Default eligibility' {
+        It 'A1 Failed/Retry runs' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Transient' -RD 'Retry')
+            (Get-RetryPlan -Manifest $m).ItemsToRun.Count | Should -Be 1
+        }
+        It 'A1 Failed/Stop is skipped and not in ItemsToRun' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -AttemptCount 2)
+            $plan = Get-RetryPlan -Manifest $m
+            $plan.ItemsToRun.Count | Should -Be 0
+            @($plan.Skipped | Where-Object { $_.SkipReason -eq 'Stop' }).Count | Should -Be 1
+        }
+        It 'A1 Pending carrying Stop runs' {
+            $m = @(D4-ManifestItem -Status 'Pending' -FK 'Permanent' -RD 'Stop')
+            (Get-RetryPlan -Manifest $m).ItemsToRun.Count | Should -Be 1
+        }
+        It 'A1 Downloading carrying Stop runs' {
+            $m = @(D4-ManifestItem -Status 'Downloading' -FK 'Permanent' -RD 'Stop')
+            (Get-RetryPlan -Manifest $m).ItemsToRun.Count | Should -Be 1
+        }
+        It 'A1 Success with invalid file runs' {
+            Mock Test-FileValidity { $false }
+            $item = D4-ManifestItem -Status 'Success' -FK 'None' -RD 'None' -OutputFilePath 'C:\bad.mp4'
+            (Get-RetryPlan -Manifest @($item)).ItemsToRun.Count | Should -Be 1
+        }
+        It 'A1 Success with valid file does not run' {
+            Mock Test-FileValidity { $true }
+            $item = D4-ManifestItem -Status 'Success' -FK 'None' -RD 'None' -OutputFilePath 'C:\ok.mp4'
+            (Get-RetryPlan -Manifest @($item)).ItemsToRun.Count | Should -Be 0
+        }
+    }
+
+    Context 'A2a None/Stop is eligible in plan' {
+        It 'Failed+None/Stop normalizes through Copy-Manifest and runs' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'None' -RD 'Stop')
+            (Get-RetryPlan -Manifest $m).ItemsToRun.Count | Should -Be 1
+        }
+    }
+
+    Context 'A3 Skipped structure' {
+        It 'A3 Stop skipped entry has exactly 7 keys' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop')
+            $plan = Get-RetryPlan -Manifest $m
+            $skip = @($plan.Skipped | Where-Object { $_.SkipReason -eq 'Stop' })
+            $skip.Count | Should -Be 1
+            $skip[0] | Should -BeOfType [hashtable]
+            $skip[0].Keys.Count | Should -Be 7
+            foreach ($k in 'Id','Url','VideoId','FailureKind','Error','AttemptCount','SkipReason') {
+                $skip[0].Keys | Should -Contain $k
+            }
+            $skip[0].FailureKind | Should -Be 'Permanent'
+        }
+        It 'A3 InvalidVideoId skipped entry has exactly 7 keys, Failed/Permanent/Stop' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Transient' -RD 'Retry' -VideoId '' -Url 'https://example.com/x')
+            $plan = Get-RetryPlan -Manifest $m
+            $skip = @($plan.Skipped | Where-Object { $_.SkipReason -eq 'InvalidVideoId' })
+            $skip.Count | Should -Be 1
+            $skip[0] | Should -BeOfType [hashtable]
+            $skip[0].Keys.Count | Should -Be 7
+            $skip[0].FailureKind | Should -Be 'Permanent'
+            $skip[0].Error       | Should -Be 'Invalid YouTube URL / VideoId'
+            $skip[0].VideoId     | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'A4 Force override' {
+        It 'A4 -Force on Failed/Stop gives Pending, None/None, AttemptCount=0, RetryCount=0 (at 1)' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -AttemptCount 1 -RetryCount 0)
+            $plan = Get-RetryPlan -Manifest $m -Force
+            $plan.ItemsToRun.Count | Should -Be 1
+            $run = $plan.ItemsToRun[0]
+            $run.Status         | Should -Be 'Pending'
+            $run.FailureKind    | Should -Be 'None'
+            $run.RetryDecision  | Should -Be 'None'
+            $run.AttemptCount   | Should -Be 0
+            $run.RetryCount     | Should -Be 0
+        }
+        It 'A4 -Force resets at 4/4' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -AttemptCount 4 -RetryCount 3)
+            $run = (Get-RetryPlan -Manifest $m -Force).ItemsToRun[0]
+            $run.AttemptCount | Should -Be 0
+            $run.RetryCount   | Should -Be 0
+        }
+    }
+
+    Context 'A4b InvalidVideoId with and without Force' {
+        It '<Case>: counters stay 4/4, Failed/Permanent/Stop, InvalidVideoId, not in ItemsToRun, not in BlockedByStop' -ForEach @(
+            @{ Case = 'no Force';   Force = $false },
+            @{ Case = 'with -Force'; Force = $true }
+        ) {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -AttemptCount 4 -RetryCount 4 -VideoId '' -Url 'https://example.com/x')
+            $plan = if ($Force) { Get-RetryPlan -Manifest $m -Force } else { Get-RetryPlan -Manifest $m }
+            $plan.ItemsToRun.Count | Should -Be 0
+            $skip = @($plan.Skipped | Where-Object { $_.SkipReason -eq 'InvalidVideoId' })
+            $skip.Count | Should -Be 1
+            $skip[0].AttemptCount | Should -Be 4
+            $skip[0].FailureKind  | Should -Be 'Permanent'
+            $plan.BlockedByStop   | Should -Be 0
+        }
+    }
+
+    Context 'A5 Invalid VideoId precedence' {
+        It 'A5 invalid-VideoId item never in ItemsToRun (with/without Force)' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Transient' -RD 'Retry' -VideoId '' -Url 'https://example.com/x')
+            (Get-RetryPlan -Manifest $m).ItemsToRun.Count         | Should -Be 0
+            (Get-RetryPlan -Manifest $m -Force).ItemsToRun.Count  | Should -Be 0
+        }
+        It 'A5 persisted Failed/Permanent/Stop with invalid VideoId is InvalidVideoId, not Stop' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -VideoId '' -Url 'https://example.com/x')
+            $plan = Get-RetryPlan -Manifest $m
+            @($plan.Skipped | Where-Object { $_.SkipReason -eq 'Stop' }).Count          | Should -Be 0
+            @($plan.Skipped | Where-Object { $_.SkipReason -eq 'InvalidVideoId' }).Count | Should -Be 1
+            $plan.BlockedByStop | Should -Be 0
+        }
+    }
+
+    Context 'A6 BlockedByStop' {
+        It 'A6 n valid Stop items -> BlockedByStop=n; 0 under Force' {
+            $m = 1..3 | ForEach-Object { D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' }
+            $plan = Get-RetryPlan -Manifest $m
+            $plan.BlockedByStop            | Should -Be 3
+            (Get-RetryPlan -Manifest $m -Force).BlockedByStop | Should -Be 0
+        }
+        It 'A6 invalid items not counted in BlockedByStop' {
+            $m = @(
+                (D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop'),
+                (D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -VideoId '' -Url 'https://example.com/x')
+            )
+            (Get-RetryPlan -Manifest $m).BlockedByStop | Should -Be 1
+        }
+    }
+
+    Context 'A10 original manifest untouched' {
+        It 'A10 $script:Manifest is identical before and after both calls' {
+            $item = D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop' -AttemptCount 2 -RetryCount 1
+            $script:Manifest = @($item)
+            $snapshot = (ConvertTo-Json -InputObject @($script:Manifest) -Depth 5 -Compress)
+            $null = Get-RetryPlan
+            (ConvertTo-Json -InputObject @($script:Manifest) -Depth 5 -Compress) | Should -Be $snapshot
+            $null = Get-RetryPlan -Force
+            (ConvertTo-Json -InputObject @($script:Manifest) -Depth 5 -Compress) | Should -Be $snapshot
+        }
+    }
+
+    Context 'A12 Skipped and BlockedByStop on every return path' {
+        It 'A12 no-candidate path' {
+            $plan = Get-RetryPlan -Manifest @()
+            $plan.Keys          | Should -Contain 'Skipped'
+            $plan.Keys          | Should -Contain 'BlockedByStop'
+            $plan.Skipped.Count | Should -Be 0
+            $plan.BlockedByStop | Should -Be 0
+        }
+        It 'A12 all-skipped path' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Permanent' -RD 'Stop')
+            $plan = Get-RetryPlan -Manifest $m
+            $plan.Keys          | Should -Contain 'Skipped'
+            $plan.Keys          | Should -Contain 'BlockedByStop'
+            $plan.Skipped.Count | Should -Be 1
+            $plan.BlockedByStop | Should -Be 1
+        }
+        It 'A12 normal path' {
+            $m = @(D4-ManifestItem -Status 'Failed' -FK 'Transient' -RD 'Retry')
+            $plan = Get-RetryPlan -Manifest $m
+            $plan.Keys             | Should -Contain 'Skipped'
+            $plan.Keys             | Should -Contain 'BlockedByStop'
+            $plan.ItemsToRun.Count | Should -Be 1
+            $plan.BlockedByStop    | Should -Be 0
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# A7: Get-RetrySkipSummary
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: Get-RetrySkipSummary' {
+    BeforeAll {
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+
+        function script:D4-MakeSkipFull {
+            param(
+                [string]$SkipReason = 'Stop',
+                [string]$FailureKind = 'Permanent',
+                [string]$Error = 'err',
+                [string]$VideoId = 'vid',
+                [string]$Url = 'url',
+                [int]$AttemptCount = 1
+            )
+            @{
+                Id           = [guid]::NewGuid().ToString()
+                Url          = $Url
+                VideoId      = $VideoId
+                FailureKind  = $FailureKind
+                Error        = $Error
+                AttemptCount = $AttemptCount
+                SkipReason   = $SkipReason
+            }
+        }
+    }
+
+    It 'A7 null input returns empty array' {
+        $r = Get-RetrySkipSummary -Skipped $null
+        @($r).Count | Should -Be 0
+    }
+    It 'A7 empty input returns empty array' {
+        $r = Get-RetrySkipSummary -Skipped @()
+        @($r).Count | Should -Be 0
+    }
+    It 'A7 header + per-reason counts' {
+        $skip = @(
+            (D4-MakeSkipFull -SkipReason 'Stop'),
+            (D4-MakeSkipFull -SkipReason 'Stop'),
+            (D4-MakeSkipFull -SkipReason 'InvalidVideoId')
+        )
+        $r = Get-RetrySkipSummary -Skipped $skip
+        $r | Should -Contain 'Skipped 3 item(s):'
+        @($r | Where-Object { $_ -match '^\s+Stop: 2\s*$' }).Count          | Should -Be 1
+        @($r | Where-Object { $_ -match '^\s+InvalidVideoId: 1\s*$' }).Count | Should -Be 1
+    }
+    It 'A7 per-kind counts for Stop only, fixed order' {
+        $skip = @(
+            (D4-MakeSkipFull -SkipReason 'Stop' -FailureKind 'Permanent'),
+            (D4-MakeSkipFull -SkipReason 'Stop' -FailureKind 'Transient'),
+            (D4-MakeSkipFull -SkipReason 'Stop' -FailureKind 'Transient'),
+            (D4-MakeSkipFull -SkipReason 'InvalidVideoId' -FailureKind 'Permanent')
+        )
+        $r = Get-RetrySkipSummary -Skipped $skip
+        $iT = -1; $iP = -1
+        for ($i = 0; $i -lt $r.Count; $i++) {
+            if ($r[$i] -match '^\s+Transient: 2\s*$')   { $iT = $i }
+            if ($r[$i] -match '^\s+Permanent: 1\s*$')   { $iP = $i }
+        }
+        $iT | Should -BeGreaterThan -1
+        $iP | Should -BeGreaterThan -1
+        $iT | Should -BeLessThan $iP
+        @($r | Where-Object { $_ -match '^\s+Permanent: \d' }).Count | Should -Be 1
+    }
+    It 'A7 cap of 5 preview lines and ... and K more' {
+        $skip = 1..7 | ForEach-Object {
+            D4-MakeSkipFull -SkipReason 'InvalidVideoId' -VideoId "vid$_" -Error "err$_"
+        }
+        $r = Get-RetrySkipSummary -Skipped $skip
+        @($r | Where-Object { $_ -match '^\s+vid\d+ - err\d+\s*$' }).Count | Should -Be 5
+        @($r | Where-Object { $_ -match '\.\.\. and 2 more' }).Count       | Should -Be 1
+    }
+    It 'A7 falls back to Url when VideoId empty' {
+        $skip = @(D4-MakeSkipFull -SkipReason 'InvalidVideoId' -VideoId '' -Url 'https://example.com/x')
+        $r = Get-RetrySkipSummary -Skipped $skip
+        @($r | Where-Object { $_ -match 'https://example\.com/x - err' }).Count | Should -Be 1
+    }
+}
+
+# ---------------------------------------------------------------------
+# A7, A8, A9, A11: Invoke-RetryPlanFlow
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: Invoke-RetryPlanFlow' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+
+        function script:D4-MakeSkip {
+            param([string]$SkipReason = 'Stop', [string]$FailureKind = 'Permanent')
+            @{
+                Id=[guid]::NewGuid().ToString(); Url='u'; VideoId='v'
+                FailureKind=$FailureKind; Error='e'; AttemptCount=1; SkipReason=$SkipReason
+            }
+        }
+        function script:D4-MakePlan {
+            param($ItemsToRun = @(), $Skipped = @(), [int]$BlockedByStop = 0, $ModifiedManifest = $null)
+            @{
+                ModifiedManifest = $ModifiedManifest
+                ItemsToRun       = @($ItemsToRun)
+                Skipped          = @($Skipped)
+                BlockedByStop    = $BlockedByStop
+            }
+        }
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    BeforeEach {
+        Mock Write-Log { }
+        Mock Read-Host { '' }
+    }
+
+    It 'A7 logs summary + Items to run' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        $script:run  = @([PSCustomObject]@{ Id = 'r1' })
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun $script:run -Skipped $script:skip -BlockedByStop 0 }
+        $null = Invoke-RetryPlanFlow
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^Skipped 1 item' -and $Color -eq 'Yellow' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -match '^Items to run: 1$' }
+    }
+
+    It 'A8 FORCE calls Get-RetryPlan -Force' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        $script:run  = @([PSCustomObject]@{ Id = 'r1' })
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 } -ParameterFilter { -not $Force }
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun $script:run -BlockedByStop 0 }              -ParameterFilter {  $Force }
+        Mock Read-Host { 'FORCE' }
+        $plan = Invoke-RetryPlanFlow
+        $plan.ItemsToRun.Count | Should -Be 1
+        Should -Invoke Get-RetryPlan -Times 1 -Exactly -ParameterFilter { -not $Force }
+        Should -Invoke Get-RetryPlan -Times 1 -Exactly -ParameterFilter {  $Force }
+    }
+
+    It 'A8 "<Answer>" does not force' -ForEach @(
+        @{ Answer = '' },
+        @{ Answer = 'force' },
+        @{ Answer = 'y' },
+        @{ Answer = 'FORCE ' }
+    ) {
+        $script:Ans  = $Answer
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 } -ParameterFilter { -not $Force }
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 } -ParameterFilter {  $Force }
+        Mock Read-Host { $script:Ans }
+        $null = Invoke-RetryPlanFlow
+        Should -Invoke Get-RetryPlan -Times 0 -Exactly -ParameterFilter { $Force }
+    }
+
+    It 'A8 $null input does not force' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 } -ParameterFilter { -not $Force }
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 } -ParameterFilter {  $Force }
+        Mock Read-Host { $null }
+        $null = Invoke-RetryPlanFlow
+        Should -Invoke Get-RetryPlan -Times 0 -Exactly -ParameterFilter { $Force }
+    }
+
+    It 'A8 no prompt when BlockedByStop=0' {
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @([PSCustomObject]@{ Id='r1' }) -BlockedByStop 0 }
+        $null = Invoke-RetryPlanFlow
+        Should -Invoke Read-Host -Times 0 -Exactly -ParameterFilter { $Prompt -match 'FORCE' }
+    }
+
+    It 'A8 prompt appears when other items are runnable' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @([PSCustomObject]@{ Id='r1' }) -Skipped $script:skip -BlockedByStop 1 }
+        $null = Invoke-RetryPlanFlow
+        Should -Invoke Read-Host -Times 1 -Exactly -ParameterFilter { $Prompt -match 'FORCE' }
+    }
+
+    It 'A8 Force applies to all blocked items' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        $script:run  = @([PSCustomObject]@{ Id='a' }, [PSCustomObject]@{ Id='b' })
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 2 } -ParameterFilter { -not $Force }
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun $script:run -BlockedByStop 0 }              -ParameterFilter {  $Force }
+        Mock Read-Host { 'FORCE' }
+        $plan = Invoke-RetryPlanFlow
+        $plan.ItemsToRun.Count | Should -Be 2
+    }
+
+    It 'A9 message 1 (Stop blocked) when BlockedByStop>0 after Enter' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 }
+        $r = Invoke-RetryPlanFlow
+        $r | Should -BeNullOrEmpty
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -like 'All eligible items are blocked (RetryDecision=Stop).*Force Retry.*'
+        }
+    }
+    It 'A9 message 2 (Invalid only) when BlockedByStop=0 and Skipped>0' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'InvalidVideoId')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 0 }
+        $r = Invoke-RetryPlanFlow
+        $r | Should -BeNullOrEmpty
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -like 'Remaining items have an invalid VideoId*'
+        }
+    }
+    It 'A9 message 3 (Nothing found) when BlockedByStop=0 and Skipped=0' {
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped @() -BlockedByStop 0 }
+        $r = Invoke-RetryPlanFlow
+        $r | Should -BeNullOrEmpty
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+            $Message -like 'No failed, pending or interrupted items found*'
+        }
+    }
+    It 'A9 message 1 is unreachable after a successful Force re-call' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'Stop')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 1 } -ParameterFilter { -not $Force }
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @([PSCustomObject]@{ Id='r1' }) -BlockedByStop 0 } -ParameterFilter {  $Force }
+        Mock Read-Host { 'FORCE' }
+        $null = Invoke-RetryPlanFlow
+        Should -Invoke Write-Log -Times 0 -Exactly -ParameterFilter { $Message -like 'All eligible items are blocked*' }
+    }
+
+    It 'A11 Force with all-invalid -> $null, message 2, no save' {
+        $script:skip = @(D4-MakeSkip -SkipReason 'InvalidVideoId')
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped @() -BlockedByStop 1 } -ParameterFilter { -not $Force }
+        Mock Get-RetryPlan { D4-MakePlan -ItemsToRun @() -Skipped $script:skip -BlockedByStop 0 -ModifiedManifest $null } -ParameterFilter {  $Force }
+        Mock Save-AtomicJson { throw 'Must not save' }
+        Mock Read-Host { 'FORCE' }
+        $r = Invoke-RetryPlanFlow
+        $r | Should -BeNullOrEmpty
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $Message -like 'Remaining items have an invalid VideoId*' }
+        Should -Invoke Save-AtomicJson -Times 0 -Exactly
+    }
+}
+
+# ---------------------------------------------------------------------
+# A13, A14: Static contracts
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: Static contracts' {
+    BeforeAll {
+        $script:ScriptPath = Join-Path $PSScriptRoot '..\Development\YT-Downloader.ps1'
+        $script:Content    = Get-Content -LiteralPath $script:ScriptPath -Raw
+
+        function script:D4-FunctionBody {
+            param([string]$Name)
+            $start = $script:Content.IndexOf("function $Name")
+            if ($start -lt 0) { return $null }
+            $next = $script:Content.IndexOf('function ', $start + 10)
+            if ($next -gt 0) { return $script:Content.Substring($start, $next - $start) }
+            return $script:Content.Substring($start)
+        }
+    }
+
+    It 'A13 no Save-AtomicJson inside Get-RetryPlan' {
+        D4-FunctionBody 'Get-RetryPlan' | Should -Not -Match 'Save-AtomicJson'
+    }
+    It 'A13 no Save-AtomicJson inside Invoke-RetryPlanFlow' {
+        D4-FunctionBody 'Invoke-RetryPlanFlow' | Should -Not -Match 'Save-AtomicJson'
+    }
+    It 'A13 no Save-AtomicJson inside Get-RetrySkipSummary' {
+        D4-FunctionBody 'Get-RetrySkipSummary' | Should -Not -Match 'Save-AtomicJson'
+    }
+    It 'A13 Main option "6" still contains Save-AtomicJson after Invoke-RetryPlanFlow' {
+        $idx = $script:Content.IndexOf('$plan = Invoke-RetryPlanFlow')
+        $idx | Should -BeGreaterThan 0
+        $script:Content.Substring($idx) | Should -Match 'Save-AtomicJson'
+    }
+
+    It 'A14 no $script: in Get-RetryPlan body (except default param)' {
+        $body = D4-FunctionBody 'Get-RetryPlan'
+        $body | Should -Not -BeNullOrEmpty
+        $stripped = $body -replace '\$Manifest\s*=\s*\$script:Manifest', ''
+        $stripped | Should -Not -Match '\$script:'
+    }
+    It 'A14 no $script: in Invoke-RetryPlanFlow body' {
+        D4-FunctionBody 'Invoke-RetryPlanFlow' | Should -Not -Match '\$script:'
+    }
+    It 'A14 no $script: in Get-RetrySkipSummary body' {
+        D4-FunctionBody 'Get-RetrySkipSummary' | Should -Not -Match '\$script:'
+    }
+}
+
+# ---------------------------------------------------------------------
+# M1, M2: End-to-end at Invoke-RetryPlanFlow
+# ---------------------------------------------------------------------
+Describe 'Phase 4 - Delivery 4: End-to-end plan flow' {
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+    }
+    AfterAll { $env:APPDATA = $script:OrigAppData }
+
+    BeforeEach {
+        $script:Config.MaxRetries = 3
+        $script:StateInitialized = $true
+        if (Test-Path $script:ManifestPath) { Remove-Item $script:ManifestPath -Force }
+        Mock Write-Log { }
+    }
+
+    It 'M1 one Permanent/Stop: Enter runs nothing; FORCE runs with AttemptCount reset to 0' {
+        $item = [PSCustomObject]@{
+            Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=AbC12345678';
+            Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0;
+            Destination=$TestDrive; Status='Failed'; Error='err'; OutputFilePath='';
+            VideoId='AbC12345678'; RetryCount=3; AttemptCount=4;
+            FailureKind='Permanent'; RetryDecision='Stop'
+        }
+        $script:Manifest = @($item)
+        [void](Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest)
+
+        Mock Read-Host { '' }
+        (Invoke-RetryPlanFlow) | Should -BeNullOrEmpty
+
+        Mock Read-Host { 'FORCE' }
+        $plan = Invoke-RetryPlanFlow
+        $plan | Should -Not -BeNullOrEmpty
+        $plan.ItemsToRun.Count | Should -Be 1
+        $plan.ItemsToRun[0].Status        | Should -Be 'Pending'
+        $plan.ItemsToRun[0].FailureKind   | Should -Be 'None'
+        $plan.ItemsToRun[0].RetryDecision | Should -Be 'None'
+        $plan.ItemsToRun[0].AttemptCount  | Should -Be 0
+        $plan.ItemsToRun[0].RetryCount    | Should -Be 0
+    }
+
+    It 'M2 one Stop + one Retry: Enter runs only Retry; FORCE runs both' {
+        $stopItem = [PSCustomObject]@{
+            Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=22222222222';
+            Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0;
+            Destination=$TestDrive; Status='Failed'; Error='e'; OutputFilePath='';
+            VideoId='22222222222'; RetryCount=0; AttemptCount=1;
+            FailureKind='Permanent'; RetryDecision='Stop'
+        }
+        $retryItem = [PSCustomObject]@{
+            Id=[guid]::NewGuid().ToString(); Url='https://youtube.com/watch?v=11111111111';
+            Mode='Video'; MaxHeight=720; AudioFormat=''; Bitrate=0;
+            Destination=$TestDrive; Status='Failed'; Error='e'; OutputFilePath='';
+            VideoId='11111111111'; RetryCount=0; AttemptCount=1;
+            FailureKind='Transient'; RetryDecision='Retry'
+        }
+        $script:Manifest = @($stopItem, $retryItem)
+        [void](Save-AtomicJson -Path $script:ManifestPath -Data $script:Manifest)
+
+        Mock Read-Host { '' }
+        $planEnter = Invoke-RetryPlanFlow
+        $planEnter.ItemsToRun.Count | Should -Be 1
+        $planEnter.ItemsToRun[0].Id | Should -Be $retryItem.Id
+
+        Mock Read-Host { 'FORCE' }
+        $planForce = Invoke-RetryPlanFlow
+        $planForce.ItemsToRun.Count | Should -Be 2
+        ($planForce.ItemsToRun.Id -contains $stopItem.Id)  | Should -BeTrue
+        ($planForce.ItemsToRun.Id -contains $retryItem.Id) | Should -BeTrue
     }
 }

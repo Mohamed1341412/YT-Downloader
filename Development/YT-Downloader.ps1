@@ -528,12 +528,20 @@ function Normalize-FailureClassification {
         return @{ FailureKind = 'None'; RetryDecision = 'None'; Reason = 'Success' }
     }
     
-    # 2. Any invalid value normalizes the whole pair to Unknown/Retry
+    # 2. Pending/Downloading always clear to None/None; reason reflects stored pair
+    if ($Status -in 'Pending', 'Downloading') {
+        $reason = if ($fkInvalid -or $rdInvalid) { 'Invalid' }
+                  elseif ($fkAbsent -or $rdAbsent) { 'Default' }
+                  else { 'Valid' }
+        return @{ FailureKind = 'None'; RetryDecision = 'None'; Reason = $reason }
+    }
+    
+    # 3. Any invalid value normalizes the whole pair to Unknown/Retry
     if ($fkInvalid -or $rdInvalid) {
         return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry'; Reason = 'Invalid' }
     }
     
-    # 3. If either is absent, default the whole pair by Status
+    # 4. If either is absent, default the whole pair by Status
     if ($fkAbsent -or $rdAbsent) {
         if ($Status -eq 'Failed') {
             return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry'; Reason = 'Default' }
@@ -543,12 +551,12 @@ function Normalize-FailureClassification {
         }
     }
     
-    # 4. Failed + None safety rule
-    if ($Status -eq 'Failed' -and $FailureKind -eq 'None') {
+    # 5. Failed + None safety rule
+    if ($Status -eq 'Failed' -and ($FailureKind -eq 'None' -or $RetryDecision -eq 'None')) {
         return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry'; Reason = 'FailedNone' }
     }
     
-    # 5. Both present and valid
+    # 6. Both present and valid
     return @{ FailureKind = $FailureKind; RetryDecision = $RetryDecision; Reason = 'Valid' }
 }
 
@@ -613,10 +621,12 @@ function Find-OutputCandidates {
 
 function Get-RetryPlan {
     param(
-        [object]$Manifest = $script:Manifest
+        [object]$Manifest = $script:Manifest,
+        [switch]$Force
     )
     $maxAttempts = Get-MaxAttempts
     $candidates = @()
+    $skipped = @()
     
     foreach ($m in $Manifest) {
         $eligible = $false
@@ -630,7 +640,7 @@ function Get-RetryPlan {
     }
 
     if ($candidates.Count -eq 0) {
-        return @{ ModifiedManifest = $null; ItemsToRun = @() }
+        return @{ ModifiedManifest = $null; ItemsToRun = @(); Skipped = @(); BlockedByStop = 0 }
     }
 
     $tempManifest = Copy-Manifest -Source $Manifest
@@ -645,19 +655,40 @@ function Get-RetryPlan {
         
         $entry = $tempManifest[$idx]
         
-        # تصفير العدادات فقط إذا كان العنصر مستنفداً بالفعل
-        if ([int]$entry.AttemptCount -ge $maxAttempts) {
-            $entry.AttemptCount = 0
-            $entry.RetryCount = 0
-        }
-        
+        $isStop = ([string]$entry.Status -eq 'Failed' -and [string]$entry.RetryDecision -eq 'Stop')
         $vid = if ($entry.VideoId) { $entry.VideoId } else { Get-VideoId -Url $entry.Url }
-        if ([string]::IsNullOrWhiteSpace($vid)) {
+        $invalid = [string]::IsNullOrWhiteSpace($vid)
+        if ($invalid) {
             $entry.Status = "Failed"
             $entry.Error = "Invalid YouTube URL / VideoId"
             $entry.FailureKind = 'Permanent'
             $entry.RetryDecision = 'Stop'
+            $skipped += @{
+                Id = $entry.Id
+                Url = $entry.Url
+                VideoId = $vid
+                FailureKind = $entry.FailureKind
+                Error = $entry.Error
+                AttemptCount = $entry.AttemptCount
+                SkipReason = 'InvalidVideoId'
+            }
             continue
+        }
+        if ($isStop -and -not $Force) {
+            $skipped += @{
+                Id = $entry.Id
+                Url = $entry.Url
+                VideoId = $vid
+                FailureKind = $entry.FailureKind
+                Error = $entry.Error
+                AttemptCount = $entry.AttemptCount
+                SkipReason = 'Stop'
+            }
+            continue
+        }
+        if ($isStop -or [int]$entry.AttemptCount -ge $maxAttempts) {
+            $entry.AttemptCount = 0
+            $entry.RetryCount = 0
         }
         
         $previousStatus = [string]$entry.Status
@@ -675,11 +706,93 @@ function Get-RetryPlan {
         $toRun += $entry
     }
     
+    $blocked = @($skipped | Where-Object { $_.SkipReason -eq 'Stop' }).Count
     if ($toRun.Count -eq 0) {
-        return @{ ModifiedManifest = $null; ItemsToRun = @() }
+        return @{ ModifiedManifest = $null; ItemsToRun = @(); Skipped = @($skipped); BlockedByStop = $blocked }
     }
     
-    return @{ ModifiedManifest = $tempManifest; ItemsToRun = $toRun }
+    return @{ ModifiedManifest = $tempManifest; ItemsToRun = $toRun; Skipped = @($skipped); BlockedByStop = $blocked }
+}
+
+function Get-RetrySkipSummary {
+    param([AllowNull()][object[]]$Skipped)
+    if ($null -eq $Skipped -or @($Skipped).Count -eq 0) {
+        return ,@()
+    }
+
+    $items = @($Skipped)
+    $lines = @()
+    $lines += "Skipped $($items.Count) item(s):"
+
+    foreach ($reason in @('Stop', 'InvalidVideoId')) {
+        $count = @($items | Where-Object { $_.SkipReason -eq $reason }).Count
+        if ($count -gt 0) {
+            $lines += "  ${reason}: $count"
+        }
+    }
+
+    foreach ($kind in @('Transient', 'Permanent', 'Configuration', 'Unknown', 'None')) {
+        $count = @($items | Where-Object { $_.SkipReason -eq 'Stop' -and $_.FailureKind -eq $kind }).Count
+        if ($count -gt 0) {
+            $lines += "    ${kind}: $count"
+        }
+    }
+
+    $previewCount = [Math]::Min(5, $items.Count)
+    for ($i = 0; $i -lt $previewCount; $i++) {
+        $item = $items[$i]
+        $display = if ([string]::IsNullOrWhiteSpace([string]$item.VideoId)) { $item.Url } else { $item.VideoId }
+        $lines += "  $display - $($item.Error)"
+    }
+
+    if ($items.Count -gt 5) {
+        $more = $items.Count - 5
+        $lines += "  ... and $more more"
+    }
+
+    return ,$lines
+}
+
+function Invoke-RetryPlanFlow {
+    $plan = Get-RetryPlan
+
+    if ($plan.Skipped.Count -gt 0) {
+        $summary = Get-RetrySkipSummary -Skipped $plan.Skipped
+        foreach ($line in @($summary)) {
+            [void](Write-Log $line "Yellow")
+        }
+    }
+
+    if ($plan.BlockedByStop -gt 0) {
+        $ans = Read-Host "Type FORCE to also retry the $($plan.BlockedByStop) blocked item(s), or press Enter to skip them"
+        if ($ans -ceq 'FORCE') {
+            $plan = Get-RetryPlan -Force
+            if ($plan.Skipped.Count -gt 0) {
+                $summary = Get-RetrySkipSummary -Skipped $plan.Skipped
+                foreach ($line in @($summary)) {
+                    [void](Write-Log $line "Yellow")
+                }
+            }
+        }
+    }
+
+    [void](Write-Log "Items to run: $($plan.ItemsToRun.Count)")
+
+    if ($plan.ItemsToRun.Count -eq 0) {
+        if ($plan.BlockedByStop -gt 0) {
+            [void](Write-Log "All eligible items are blocked (RetryDecision=Stop). Fix the cause, then use Force Retry." "Yellow")
+        }
+        elseif ($plan.Skipped.Count -gt 0) {
+            [void](Write-Log "Remaining items have an invalid VideoId and cannot be retried." "Yellow")
+        }
+        else {
+            [void](Write-Log "No failed, pending or interrupted items found." "Yellow")
+        }
+        [void](Read-Host "Press Enter to continue")
+        return $null
+    }
+
+    return $plan
 }
 
 function Copy-Manifest {
@@ -1139,6 +1252,9 @@ function Set-ItemState {
     if ($Status -eq 'Success') {
         $target.FailureKind = 'None'; $target.RetryDecision = 'None'
     }
+    elseif ($Status -in 'Pending', 'Downloading') {
+        $target.FailureKind = 'None'; $target.RetryDecision = 'None'
+    }
     elseif (-not $fkPassed -and -not $rdPassed) {
         if ($Status -eq 'Failed') {
             Write-Log "[WARNING] Failed without FailureKind/RetryDecision. Using Unknown/Retry" "Yellow"
@@ -1154,7 +1270,7 @@ function Set-ItemState {
         }
         $target.FailureKind = if ($fkPassed) { $FailureKind }   else { 'Unknown' }
         $target.RetryDecision = if ($rdPassed) { $RetryDecision } else { 'Retry' }
-        if ($Status -eq 'Failed' -and $target.FailureKind -eq 'None') {
+        if ($Status -eq 'Failed' -and ($target.FailureKind -eq 'None' -or $target.RetryDecision -eq 'None')) {
             Write-Log "[WARNING] Failed + FailureKind=None. Normalizing to Unknown/Retry" "Yellow"
             $target.FailureKind = 'Unknown'; $target.RetryDecision = 'Retry'
         }
@@ -1951,7 +2067,6 @@ function Invoke-ItemDownload {
     return $false
 }
 
-
 function Start-DownloadRun {
     param([PSCustomObject[]]$Items, [bool]$IsResume = $false)
     $script:CurrentRunItems = @($Items)
@@ -2240,13 +2355,9 @@ function Main {
                 }
             }
             "6" {
-                $plan = Get-RetryPlan
-                if ($plan.ItemsToRun.Count -eq 0) {
-                    Write-Log "No eligible items to retry. The attempt budget may be exhausted or no failed items found." "Yellow"
-                    Read-Host "Press Enter to continue"
-                    continue
-                }
-                
+                $plan = Invoke-RetryPlanFlow
+                if (-not $plan) { continue }
+
                 if (Save-AtomicJson -Path $script:ManifestPath -Data $plan.ModifiedManifest) {
                     $script:Manifest = $plan.ModifiedManifest
                     $itemsToRun = $plan.ItemsToRun
