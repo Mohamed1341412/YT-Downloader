@@ -1,12 +1,9 @@
 ﻿#Requires -Version 5.1
-#==============================================================================
+
 # Safe Execution Guard (Prevents Main/Mutex execution during Pester Dot-sourcing)
-#==============================================================================
 $script:RunAsMain = $MyInvocation.InvocationName -ne '.'
 
-#==============================================================================
 # Global Configuration & State
-#==============================================================================
 $script:AppDir = Join-Path $env:APPDATA "YT-DL-CLI"
 $script:ManifestPath = Join-Path $script:AppDir "manifest.json"
 $script:SettingsPath = Join-Path $script:AppDir "settings.json"
@@ -59,9 +56,8 @@ if ($script:RunAsMain) {
     }
 }
 
-#==============================================================================
 # Helpers & Validation
-#==============================================================================
+
 function Test-MaxRetriesConfig {
     param([Parameter(Mandatory = $false)]$Value = $script:Config.MaxRetries)
     if ($Value -isnot [int]) { return $false }
@@ -1323,9 +1319,8 @@ function Set-ItemState {
     return $true
 }
 
-#==============================================================================
 # Logging & Core Helpers
-#==============================================================================
+
 function Write-Log {
     param([string]$Message, [string]$Color = "White")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -1452,9 +1447,8 @@ function Test-FileValidity {
     return $false
 }
 
-#==============================================================================
 # Menu & Prompts
-#==============================================================================
+
 function Show-MainMenu {
     Clear-Host
     Write-Log "========================================" "Cyan"
@@ -1533,9 +1527,8 @@ function Get-UrlsFromInput {
     return , $urls
 }
 
-#==============================================================================
 # Core Execution & Verification
-#==============================================================================
+
 function Get-PlaylistUrls {
     param([string]$Url)
     Write-Log "Extracting playlist URLs..." "Cyan"
@@ -2232,9 +2225,7 @@ function Invoke-Hibernation {
     else { Write-Log "Hibernation not supported." "Yellow" }
 }
 
-#==============================================================================
 # Main Application Loop
-#==============================================================================
 function Main {
     if (-not (Test-Dependencies)) { Read-Host "Press Enter to exit"; exit 1 }
     while ($true) {
@@ -2391,9 +2382,7 @@ function Main {
     }
 }
 
-#==============================================================================
 # Safe Execution Guard for Main Loop
-#==============================================================================
 if ($script:RunAsMain) {
     try {
         Initialize-App
