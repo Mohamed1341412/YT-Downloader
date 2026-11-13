@@ -3014,6 +3014,7 @@ Describe 'Phase 4 - Delivery 3: Invoke-ItemDownload behavior' {
         $script:goodFile = Join-Path (Join-Path $TestDrive 'dest') 'existing_AbC12345678.mp4'
         Set-Content -Path $script:goodFile -Value 'x' -Force
         Mock Test-FileValidity { $true }
+        Mock Get-FileVerdict { @{ Verdict = 'Valid'; Reason = 'OK' } }
         Mock yt-dlp { } 
         $item = New-TestItem
         $item.OutputFilePath = $script:goodFile
@@ -4150,5 +4151,477 @@ Describe 'Phase 4 - Delivery 4: End-to-end plan flow' {
         $planForce.ItemsToRun.Count | Should -Be 2
         ($planForce.ItemsToRun.Id -contains $stopItem.Id)  | Should -BeTrue
         ($planForce.ItemsToRun.Id -contains $retryItem.Id) | Should -BeTrue
+    }
+}
+
+# =====================================================================
+# Phase 4 - Delivery 5: D5 Strict Existing-Output Validation
+# =====================================================================
+Describe 'D5 Strict Existing-Output Check' {
+
+    # Discovery-time NV set (A6): six non-Valid verdict results.
+    $d5NvCases = @(
+        @{ Label = 'Corrupt';   Verdict = @{ Verdict = 'Corrupt';   Reason = 'bad' } }
+        @{ Label = 'OtherMode'; Verdict = @{ Verdict = 'OtherMode'; Reason = 'wrong mode' } }
+        @{ Label = 'Unknown';   Verdict = @{ Verdict = 'Unknown';   Reason = 'ffprobe' } }
+        @{ Label = 'null';      Verdict = $null }
+        @{ Label = 'empty';     Verdict = @{} }
+        @{ Label = 'Bogus';     Verdict = @{ Verdict = 'Bogus' } }
+    )
+
+    BeforeAll {
+        $script:OrigAppData = $env:APPDATA
+        $env:APPDATA = $TestDrive
+        $script:AppDir = Join-Path $env:APPDATA 'YT-DL-CLI'
+        New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AppDir 'Logs') -Force | Out-Null
+        . "$PSScriptRoot\..\Development\YT-Downloader.ps1"
+
+        function global:yt-dlp { }
+
+        $script:D5Dest = Join-Path $TestDrive 'D5Dest'
+        New-Item -ItemType Directory -Path $script:D5Dest -Force | Out-Null
+        $script:D5ExistingFile = Join-Path $script:D5Dest 'existing_AbC12345678.mp4'
+        Set-Content -LiteralPath $script:D5ExistingFile -Value 'dummy video content' -Force
+
+        function script:New-D5Item {
+            param($Mode = 'Video', [string]$Status = 'Pending', [int]$AttemptCount = 0, $OutputFilePath)
+            if (-not $PSBoundParameters.ContainsKey('OutputFilePath')) { $OutputFilePath = $script:D5ExistingFile }
+            [PSCustomObject]@{
+                Id             = [guid]::NewGuid().ToString()
+                Url            = 'https://youtube.com/watch?v=AbC12345678'
+                Mode           = $Mode
+                MaxHeight      = 720
+                AudioFormat    = ''
+                Bitrate        = 0
+                Destination    = $script:D5Dest
+                Status         = $Status
+                Error          = ''
+                OutputFilePath = $OutputFilePath
+                VideoId        = 'AbC12345678'
+                RetryCount     = 0
+                AttemptCount   = $AttemptCount
+                FailureKind    = 'None'
+                RetryDecision  = 'None'
+            }
+        }
+
+        # 'Error' is an alias of Set-ItemState's ErrorMessage parameter.
+        # Read whichever key the binding engine recorded (PS 5.1 / PS 7 safe).
+        function script:Get-D5Error {
+            param([hashtable]$Call)
+            if ($Call.ContainsKey('ErrorMessage')) { return $Call['ErrorMessage'] }
+            if ($Call.ContainsKey('Error'))        { return $Call['Error'] }
+            return $null
+        }
+
+        Mock Get-MaxAttempts { return 4 }
+        Mock Write-Log { }
+        Mock Start-Sleep { }
+        Mock Test-FileValidity { return $true }
+        Mock yt-dlp { $global:LASTEXITCODE = 0 }
+        Mock Move-ToInvalid { return @{ Success = $true; NewPath = 'x.invalid_123'; Error = $null } }
+        Mock Get-VerdictFailureClass { return @{ FailureKind = 'Unknown'; RetryDecision = 'Retry' } }
+
+        # The param block is required: Pester splats the bound parameters into the mock
+        # body, so without it the body's own $PSBoundParameters is empty.
+        # Signature mirrors Set-ItemState, including the 'Error' alias.
+        Mock Set-ItemState {
+            param(
+                [PSCustomObject]$Item,
+                [string]$Status,
+                [Alias('Error')][string]$ErrorMessage = "",
+                [AllowNull()][string]$OutputFilePath = $null,
+                [AllowNull()][string]$VideoId = $null,
+                [AllowNull()][string]$Destination = $null,
+                [int]$RetryCount = -1,
+                [int]$AttemptCount = -1,
+                [string]$FailureKind = $null,
+                [string]$RetryDecision = $null
+            )
+            $copy = @{}
+            foreach ($k in $PSBoundParameters.Keys) { $copy[$k] = $PSBoundParameters[$k] }
+            $script:sisCalls.Add($copy)
+            return $script:sisReturn
+        }
+        Mock Get-VideoId {
+            $script:sisAtVid = $script:sisCalls.Count
+            return $script:d5VideoId
+        }
+    }
+
+    AfterAll {
+        Remove-Item function:\yt-dlp -ErrorAction SilentlyContinue
+        $env:APPDATA = $script:OrigAppData
+    }
+
+    BeforeEach {
+        $script:sisCalls  = New-Object 'System.Collections.Generic.List[object]'
+        $script:sisAtVid  = -1
+        $script:sisReturn = $true
+        $script:d5VideoId = ''          # fall-through
+    }
+
+    Context 'Runtime - mocked Get-FileVerdict' {
+
+        BeforeAll {
+            Mock Get-FileVerdict { return $script:d5Verdict }
+        }
+
+        BeforeEach {
+            $script:d5Verdict = @{ Verdict = 'Valid'; Reason = 'OK' }
+        }
+
+        # ---------- A1 ----------
+        It 'A1 Verdict=Valid Mode=<Mode> accepts with exactly one Success state call' -ForEach @(
+            @{ Mode = 'Video' }, @{ Mode = 'Audio' }
+        ) {
+            $item = New-D5Item -Mode $Mode
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeTrue
+            $script:sisCalls.Count | Should -Be 1
+            $script:sisCalls[0]['Status'] | Should -Be 'Success'
+            (Get-D5Error $script:sisCalls[0]) | Should -Be 'Verified existing output'
+            Should -Invoke -CommandName Get-VideoId -Times 0 -Exactly
+        }
+
+        It 'A1 NV=<Label> fall-through never produces a Success state call' -ForEach $d5NvCases {
+            $script:d5Verdict = $Verdict
+            $item = New-D5Item
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            @($script:sisCalls | Where-Object { $_['Status'] -eq 'Success' }).Count | Should -Be 0
+        }
+
+        # ---------- A2 ----------
+        It 'A2 NV=<Label> fall-through makes no Set-ItemState call before Get-VideoId' -ForEach $d5NvCases {
+            $script:d5Verdict = $Verdict
+            $item = New-D5Item
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            $script:sisAtVid | Should -Be 0
+        }
+
+        # ---------- A3 ----------
+        It 'A3 NV=<Label> reaches Get-VideoId once, no premature Success, expected Failed tail' -ForEach $d5NvCases {
+            $script:d5Verdict = $Verdict
+            $item = New-D5Item
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            Should -Invoke -CommandName Get-VideoId -Times 1 -Exactly
+            $script:sisAtVid | Should -Be 0
+            @($script:sisCalls | Where-Object { $_['Status'] -eq 'Success' }).Count | Should -Be 0
+            $script:sisCalls.Count | Should -Be 1
+            $script:sisCalls[-1]['Status']        | Should -Be 'Failed'
+            $script:sisCalls[-1]['FailureKind']   | Should -Be 'Permanent'
+            $script:sisCalls[-1]['RetryDecision'] | Should -Be 'Stop'
+            (Get-D5Error $script:sisCalls[-1])    | Should -Be 'Cannot extract video id'
+        }
+
+        # ---------- A4 ----------
+        It 'A4 Verdict=Unknown fall-through does not classify at the existing-output site' {
+            $script:d5Verdict = @{ Verdict = 'Unknown'; Reason = 'ffprobe' }
+            $item = New-D5Item
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            Should -Invoke -CommandName Get-VerdictFailureClass -Times 0 -Exactly
+        }
+
+        # ---------- A5 ----------
+        It 'A5 Test-HibernateEligibility uses Test-FileValidity once and never Get-FileVerdict' {
+            $script:RunState.ManifestSaved         = $true
+            $script:RunState.SettingsSaved         = $true
+            $script:RunState.LogsWritten           = $true
+            $script:RunState.Interrupted           = $false
+            $script:RunState.DownloadsCompleted    = $true
+            $script:RunState.VerificationsPassed   = $true
+            $script:RunState.PreviousInstanceCrashed = $false
+            $script:StateInitialized               = $true
+            $item = New-D5Item -Status 'Success'
+            $script:CurrentRunItems = @($item)
+            Test-HibernateEligibility -Requested $true | Should -BeTrue
+            Should -Invoke -CommandName Test-FileValidity -Times 1 -Exactly
+            Should -Invoke -CommandName Get-FileVerdict   -Times 0 -Exactly
+        }
+
+        It 'A5 Test-HibernateEligibility returns false when Test-FileValidity fails' {
+            $script:RunState.ManifestSaved         = $true
+            $script:RunState.SettingsSaved         = $true
+            $script:RunState.LogsWritten           = $true
+            $script:RunState.Interrupted           = $false
+            $script:RunState.DownloadsCompleted    = $true
+            $script:RunState.VerificationsPassed   = $true
+            $script:RunState.PreviousInstanceCrashed = $false
+            $script:StateInitialized               = $true
+            $item = New-D5Item -Status 'Success'
+            $script:CurrentRunItems = @($item)
+            Mock Test-FileValidity { return $false }
+            Test-HibernateEligibility -Requested $true | Should -BeFalse
+        }
+
+        # ---------- A6 ----------
+        It 'A6 Valid verdict with mocked Set-ItemState never calls Test-FileValidity' {
+            $item = New-D5Item
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeTrue
+            Should -Invoke -CommandName Test-FileValidity -Times 0 -Exactly
+        }
+
+        It 'A6 OutputFilePath=<Label> skips Get-FileVerdict and falls through' -ForEach @(
+            @{ Label = 'empty';      Path = '' }
+            @{ Label = 'whitespace'; Path = ' ' }
+            @{ Label = 'null';       Path = $null }
+        ) {
+            $item = New-D5Item -OutputFilePath $Path
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            Should -Invoke -CommandName Get-FileVerdict -Times 0 -Exactly
+            Should -Invoke -CommandName Get-VideoId     -Times 1 -Exactly
+            $script:sisAtVid | Should -Be 0
+        }
+
+        It 'A6/R5 Valid verdict with Set-ItemState returning false returns false without Get-VideoId' {
+            $script:sisReturn = $false
+            $item = New-D5Item
+            $script:Manifest = @($item)
+            { $script:D5Result = Invoke-ItemDownload -Item $item } | Should -Not -Throw
+            $script:D5Result | Should -BeFalse
+            Should -Invoke -CommandName Get-VideoId -Times 0 -Exactly
+        }
+
+        # ---------- A8 ----------
+        It 'A8 Mode=<Label> is never bound to Get-FileVerdict and falls through without throwing' -ForEach @(
+            @{ Label = 'empty'; Mode = '' }
+            @{ Label = 'null';  Mode = $null }
+            @{ Label = 'Other'; Mode = 'Other' }
+        ) {
+            $item = New-D5Item -Mode $Mode
+            $script:Manifest = @($item)
+            { $script:D5Result = Invoke-ItemDownload -Item $item } | Should -Not -Throw
+            $script:D5Result | Should -BeFalse
+            Should -Invoke -CommandName Get-FileVerdict -Times 0 -Exactly
+            Should -Invoke -CommandName Get-VideoId     -Times 1 -Exactly
+            $script:sisAtVid | Should -Be 0
+            @($script:sisCalls | Where-Object { $_['Status'] -eq 'Success' }).Count | Should -Be 0
+        }
+
+        # ---------- R2 (owner-accepted) ----------
+        It 'R2-primary Status=<Status> AttemptCount=4 skips the loop and ends Failed/Unknown/Retry' -ForEach @(
+            @{ Status = 'Failed' }, @{ Status = 'Pending' }
+        ) {
+            $script:d5Verdict = @{ Verdict = 'Corrupt'; Reason = 'bad' }
+            $script:d5VideoId = 'abc'
+            $item = New-D5Item -Status $Status -AttemptCount 4
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            $script:sisCalls[-1]['Status']        | Should -Be 'Failed'
+            $script:sisCalls[-1]['FailureKind']   | Should -Be 'Unknown'
+            $script:sisCalls[-1]['RetryDecision'] | Should -Be 'Retry'
+            @($script:sisCalls | Where-Object { $_['Status'] -eq 'Downloading' }).Count | Should -Be 0
+            @($script:sisCalls | Where-Object { $_.ContainsKey('AttemptCount') }).Count | Should -Be 0
+            @($script:sisCalls | Where-Object { $_.ContainsKey('RetryCount') }).Count   | Should -Be 0
+            Should -Invoke -CommandName yt-dlp -Times 0 -Exactly
+        }
+
+        It 'R2-secondary owner-accepted R2: Success AttemptCount=4 ends Failed/Unknown/Retry' {
+            $script:d5Verdict = @{ Verdict = 'Corrupt'; Reason = 'bad' }
+            $script:d5VideoId = 'abc'
+            $item = New-D5Item -Status 'Success' -AttemptCount 4
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            $script:sisCalls[-1]['Status']        | Should -Be 'Failed'
+            $script:sisCalls[-1]['FailureKind']   | Should -Be 'Unknown'
+            $script:sisCalls[-1]['RetryDecision'] | Should -Be 'Retry'
+            @($script:sisCalls | Where-Object { $_['Status'] -eq 'Downloading' }).Count | Should -Be 0
+            @($script:sisCalls | Where-Object { $_.ContainsKey('AttemptCount') }).Count | Should -Be 0
+            @($script:sisCalls | Where-Object { $_.ContainsKey('RetryCount') }).Count   | Should -Be 0
+            Should -Invoke -CommandName yt-dlp -Times 0 -Exactly
+        }
+
+        # ---------- R6 ----------
+        It 'R6 Pending with empty OutputFilePath never calls Get-FileVerdict and falls through' {
+            $item = New-D5Item -Status 'Pending' -Mode 'Video' -OutputFilePath ''
+            $script:Manifest = @($item)
+            Invoke-ItemDownload -Item $item | Should -BeFalse
+            Should -Invoke -CommandName Get-FileVerdict -Times 0 -Exactly
+            Should -Invoke -CommandName Get-VideoId     -Times 1 -Exactly
+        }
+    }
+
+    Context 'Runtime - real Get-FileVerdict (A8 case-insensitive Mode)' {
+
+        BeforeEach {
+            Mock Get-MediaInfo {
+                return @{ Success = $true; HasVideo = $true; HasAudio = $false
+                          VideoPackets = 100; AudioPackets = 0; Duration = 10.0
+                          Error = $null; IsCommandFailure = $false }
+            }
+        }
+
+        It 'A8 Mode=video (lowercase) binds case-insensitively and accepts the existing output' {
+            $item = New-D5Item -Mode 'video'
+            $script:Manifest = @($item)
+            { $script:D5Result = Invoke-ItemDownload -Item $item } | Should -Not -Throw
+            $script:D5Result | Should -BeTrue
+            $script:sisCalls.Count | Should -Be 1
+            $script:sisCalls[0]['Status'] | Should -Be 'Success'
+            (Get-D5Error $script:sisCalls[0]) | Should -Be 'Verified existing output'
+        }
+    }
+
+    Context 'AST and source contracts' {
+
+        BeforeAll {
+            $script:D5ScriptPath = Join-Path $PSScriptRoot '..\Development\YT-Downloader.ps1'
+            $d5Tokens = $null; $d5Errors = $null
+            $script:D5Ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:D5ScriptPath, [ref]$d5Tokens, [ref]$d5Errors)
+            $script:D5Funcs = @($script:D5Ast.FindAll(
+                { param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+            function script:Get-D5FunctionAst {
+                param([string]$Name)
+                return @($script:D5Funcs | Where-Object { $_.Name -eq $Name })[0]
+            }
+            function script:Get-D5Commands {
+                param($Root, [string]$Name)
+                if ($null -eq $Root) { return @() }
+                $all = @($Root.FindAll(
+                    { param($a) $a -is [System.Management.Automation.Language.CommandAst] }, $true))
+                if ([string]::IsNullOrEmpty($Name)) { return $all }
+                return @($all | Where-Object { $_.GetCommandName() -eq $Name })
+            }
+
+            $script:D5InvokeAst = Get-D5FunctionAst 'Invoke-ItemDownload'
+            $d5Stmts = @($script:D5InvokeAst.Body.EndBlock.Statements)
+            $d5Idx = -1
+            for ($i = 0; $i -lt $d5Stmts.Count; $i++) {
+                if ($d5Stmts[$i] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $d5Stmts[$i].Left.Extent.Text -eq '$expectedId') { $d5Idx = $i; break }
+            }
+            $script:D5ExpectedIdIndex = $d5Idx
+            $script:D5PreStmt  = if ($d5Idx -ge 2) { $d5Stmts[$d5Idx - 2] } else { $null }
+            $script:D5Site     = if ($d5Idx -ge 1) { $d5Stmts[$d5Idx - 1] } else { $null }
+        }
+
+        It 'A2 the site is the IfStatementAst between the $dest try/catch and $expectedId, with one Get-FileVerdict and one Set-ItemState in the Valid branch' {
+            $script:D5ExpectedIdIndex | Should -BeGreaterThan 1
+            $script:D5PreStmt | Should -BeOfType ([System.Management.Automation.Language.TryStatementAst])
+            $script:D5Site    | Should -BeOfType ([System.Management.Automation.Language.IfStatementAst])
+            (Get-D5Commands -Root $script:D5Site -Name 'Get-FileVerdict').Count | Should -Be 1
+            (Get-D5Commands -Root $script:D5Site -Name 'Set-ItemState').Count   | Should -Be 1
+            $d5Ifs = @($script:D5Site.FindAll(
+                { param($a) $a -is [System.Management.Automation.Language.IfStatementAst] }, $true))
+            $d5ValidIf = @($d5Ifs | Where-Object {
+                $_.Clauses[0].Item1.Extent.Text -match "Verdict\s*-eq\s*'Valid'" })
+            $d5ValidIf.Count | Should -Be 1
+            (Get-D5Commands -Root $d5ValidIf[0] -Name 'Set-ItemState').Count | Should -Be 1
+        }
+
+        It 'A2 the site contains zero Write-Log, Move-ToInvalid, Get-VerdictFailureClass and Test-FileValidity calls' {
+            $script:D5Site | Should -Not -BeNullOrEmpty
+            foreach ($n in 'Write-Log', 'Move-ToInvalid', 'Get-VerdictFailureClass', 'Test-FileValidity') {
+                (Get-D5Commands -Root $script:D5Site -Name $n).Count | Should -Be 0
+            }
+        }
+
+        It 'A5 Test-FileValidity is absent from Invoke-ItemDownload and present in the four protected functions' {
+            (Get-D5Commands -Root $script:D5InvokeAst -Name 'Test-FileValidity').Count | Should -Be 0
+            foreach ($n in 'Test-HibernateEligibility', 'Get-RetryPlan', 'Start-DownloadRun', 'Set-ItemState') {
+                $f = Get-D5FunctionAst $n
+                $f | Should -Not -BeNullOrEmpty
+                (Get-D5Commands -Root $f -Name 'Test-FileValidity').Count | Should -BeGreaterThan 0
+            }
+        }
+
+        It 'A7 the Invoke-ItemDownload param block is preserved' {
+            # FunctionDefinitionAst exposes Parameters/Body; ParamBlock lives on Body.
+            $pb = $script:D5InvokeAst.Body.ParamBlock
+            $pb | Should -Not -BeNullOrEmpty
+            ($pb.Extent.Text -replace '\s+', ' ').Trim() | Should -Be 'param([PSCustomObject]$Item)'
+        }
+
+        It 'A7 the only $script: tokens in Invoke-ItemDownload are AudioArchive and VideoArchive' {
+            $rx = [regex]::Matches($script:D5InvokeAst.Extent.Text, '\$script:([A-Za-z_][A-Za-z0-9_]*)')
+            $names = @($rx | ForEach-Object { $_.Groups[1].Value })
+            $names.Count | Should -Be 2
+            (@($names | Sort-Object -Unique) -join ',') | Should -Be 'AudioArchive,VideoArchive'
+        }
+
+        It 'A7 Get-MaxAttempts is called exactly once in Invoke-ItemDownload' {
+            (Get-D5Commands -Root $script:D5InvokeAst -Name 'Get-MaxAttempts').Count | Should -Be 1
+        }
+    }
+
+    # A4/A5/A7 - Source equality against the pre-D5 baseline.
+    # DELIVERY-SCOPED CONTRACT: pinned to the immediate pre-D5 commit. If a later
+    # delivery legitimately changes any of these eight functions, this Context
+    # must be re-baselined or retired. Requires git + full history at test time.
+    Context 'Pre-D5 baseline preservation (A4/A5/A7)' {
+
+        BeforeAll {
+            $script:D5BaselineCommit = '9618d3a1b3c5acafd2a21e47570074bc8f034f3d'
+            $script:D5RepoRoot       = Split-Path -Path $PSScriptRoot -Parent
+            $script:D5BaselineError  = $null
+            $script:D5BaselineMap    = @{}
+            $script:D5CurrentMap     = @{}
+
+            function script:Get-D5FuncMap {
+                param([string]$Text)
+                $t = $null; $e = $null
+                $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$t, [ref]$e)
+                $map = @{}
+                $funcs = @($ast.FindAll(
+                    { param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+                foreach ($f in $funcs) {
+                    if (-not $map.ContainsKey($f.Name)) { $map[$f.Name] = $f.Extent.Text }
+                }
+                return $map
+            }
+
+            if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
+                $script:D5BaselineError = 'git is not on PATH; the pre-D5 baseline cannot be read.'
+            }
+            else {
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = 'git'
+                $psi.Arguments = "-C `"$($script:D5RepoRoot)`" show $($script:D5BaselineCommit):Development/YT-Downloader.ps1"
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError  = $true
+                $psi.UseShellExecute        = $false
+                $proc    = [System.Diagnostics.Process]::Start($psi)
+                $errTask = $proc.StandardError.ReadToEndAsync()
+                $ms      = New-Object System.IO.MemoryStream
+                $proc.StandardOutput.BaseStream.CopyTo($ms)
+                $proc.WaitForExit()
+                if ($proc.ExitCode -ne 0) {
+                    $script:D5BaselineError = "git show failed (exit $($proc.ExitCode)): $($errTask.Result)"
+                }
+                else {
+                    $utf8     = New-Object System.Text.UTF8Encoding($false)
+                    $baseText = $utf8.GetString($ms.ToArray()).TrimStart([char]0xFEFF) -replace "`r`n", "`n"
+                    $curPath  = Join-Path $script:D5RepoRoot 'Development\YT-Downloader.ps1'
+                    $curText  = $utf8.GetString([System.IO.File]::ReadAllBytes($curPath)).TrimStart([char]0xFEFF) -replace "`r`n", "`n"
+                    $script:D5BaselineMap = Get-D5FuncMap -Text $baseText
+                    $script:D5CurrentMap  = Get-D5FuncMap -Text $curText
+                }
+            }
+        }
+
+        It 'A4/A5/A7 <Name> Extent.Text is identical to the pre-D5 baseline' -ForEach @(
+            @{ Name = 'Get-VerdictFailureClass' }
+            @{ Name = 'Get-FileVerdict' }
+            @{ Name = 'Test-FileValidity' }
+            @{ Name = 'Test-HibernateEligibility' }
+            @{ Name = 'Set-ItemState' }
+            @{ Name = 'Get-RetryPlan' }
+            @{ Name = 'Start-DownloadRun' }
+            @{ Name = 'Main' }
+        ) {
+            $script:D5BaselineError | Should -BeNullOrEmpty -Because 'the pre-D5 baseline must be readable via git'
+            $script:D5BaselineMap.ContainsKey($Name) | Should -BeTrue -Because "the baseline must define $Name"
+            $script:D5CurrentMap.ContainsKey($Name)  | Should -BeTrue -Because "the current file must define $Name"
+            $script:D5CurrentMap[$Name] | Should -BeExactly $script:D5BaselineMap[$Name]
+        }
     }
 }

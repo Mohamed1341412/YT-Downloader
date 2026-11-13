@@ -1748,9 +1748,12 @@ function Invoke-ItemDownload {
         return $false
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($Item.OutputFilePath) -and (Test-FileValidity -FilePath $Item.OutputFilePath -Mode $Item.Mode)) {
-        if (-not (Set-ItemState -Item $Item -Status "Success" -Error "Verified existing output")) { return $false }
-        return $true
+    if (-not [string]::IsNullOrWhiteSpace($Item.OutputFilePath) -and $Item.Mode -in @('Video', 'Audio')) {
+        $existingVerdict = Get-FileVerdict -FilePath $Item.OutputFilePath -Mode $Item.Mode
+        if ($existingVerdict -and $existingVerdict.Verdict -eq 'Valid') {
+            if (-not (Set-ItemState -Item $Item -Status "Success" -Error "Verified existing output")) { return $false }
+            return $true
+        }
     }
 
     $expectedId = Get-VideoId -Url $Item.Url
