@@ -4270,6 +4270,19 @@ Describe 'D5 Strict Existing-Output Check' {
 
         BeforeEach {
             $script:d5Verdict = @{ Verdict = 'Valid'; Reason = 'OK' }
+
+            # Snapshot shared script state so the A5 Hibernate tests cannot leak
+            # into later Describes. $script:RunState is a hashtable (7 keys).
+            $script:d5SavedRunState = @{}
+            foreach ($k in @($script:RunState.Keys)) { $script:d5SavedRunState[$k] = $script:RunState[$k] }
+            $script:d5SavedInit  = $script:StateInitialized
+            $script:d5SavedItems = $script:CurrentRunItems
+        }
+
+        AfterEach {
+            foreach ($k in $script:d5SavedRunState.Keys) { $script:RunState[$k] = $script:d5SavedRunState[$k] }
+            $script:StateInitialized = $script:d5SavedInit
+            $script:CurrentRunItems  = $script:d5SavedItems
         }
 
         # ---------- A1 ----------
