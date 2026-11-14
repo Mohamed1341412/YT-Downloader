@@ -1,0 +1,11 @@
+http-429
+# source: local simulated server
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: http-429
+# args: http://localhost:8765/429.mp4
+# exit code: 1
+---
+[generic] Extracting URL: http://localhost:8765/429.mp4
+[generic] 429: Downloading webpage
+ERROR: [generic] 429: Unable to download webpage: HTTP Error 429: Too Many Requests (caused by <HTTPError 429: Too Many Requests>)

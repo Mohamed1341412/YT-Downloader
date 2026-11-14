@@ -1,0 +1,11 @@
+http-404
+# source: local simulated server
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: http-404
+# args: http://localhost:8765/404.mp4
+# exit code: 1
+---
+[generic] Extracting URL: http://localhost:8765/404.mp4
+[generic] 404: Downloading webpage
+ERROR: [generic] 404: Unable to download webpage: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)

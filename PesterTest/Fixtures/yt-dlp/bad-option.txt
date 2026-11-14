@@ -1,0 +1,11 @@
+bad-option
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-05
+# case: bad-option
+# args: --simulate --no-such-option https://www.youtube.com/watch?v=AepZZKeGzyc
+# exit code: 2
+---
+
+Usage: yt-dlp.exe [OPTIONS] URL [URL...]
+
+yt-dlp.exe: error: no such option: --no-such-option

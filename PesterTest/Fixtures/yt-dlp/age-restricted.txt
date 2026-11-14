@@ -1,0 +1,15 @@
+age-restricted
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: age-restricted
+# args: --simulate https://youtu.be/i5EoLex755k
+# exit code: 1
+---
+[youtube] Extracting URL: https://youtu.be/i5EoLex755k
+[youtube] i5EoLex755k: Downloading webpage
+[youtube] i5EoLex755k: Downloading visionos player API JSON
+[youtube] i5EoLex755k: This video is age-restricted; some formats may be missing without authentication. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+[youtube] i5EoLex755k: Downloading web embedded client config
+[youtube] i5EoLex755k: Downloading player 4a1e575f-main
+[youtube] i5EoLex755k: Downloading web embedded player API JSON
+ERROR: [youtube] i5EoLex755k: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies

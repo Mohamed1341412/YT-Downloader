@@ -1,0 +1,12 @@
+success-baseline
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: success-baseline
+# args: --simulate https://www.youtube.com/watch?v=AepZZKeGzyc
+# exit code: 0
+---
+[youtube] Extracting URL: https://www.youtube.com/watch?v=AepZZKeGzyc
+[youtube] AepZZKeGzyc: Downloading webpage
+[youtube] AepZZKeGzyc: Downloading visionos player API JSON
+[youtube] AepZZKeGzyc: Downloading m3u8 information
+[info] AepZZKeGzyc: Downloading 1 format(s): 616+251-17

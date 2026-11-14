@@ -1,0 +1,11 @@
+nonexistent-id
+# yt-dlp version: 2026.08.19
+# captured: 2026-11-04
+# case: nonexistent-id
+# args: --simulate https://www.youtube.com/watch?v=Zq0000000Zq
+# exit code: 1
+---
+[youtube] Extracting URL: https://www.youtube.com/watch?v=Zq0000000Zq
+[youtube] Zq0000000Zq: Downloading webpage
+[youtube] Zq0000000Zq: Downloading visionos player API JSON
+ERROR: [youtube] Zq0000000Zq: This video is unavailable
